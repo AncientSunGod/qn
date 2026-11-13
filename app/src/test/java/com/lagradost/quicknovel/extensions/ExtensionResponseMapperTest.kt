@@ -1,0 +1,188 @@
+package com.lagradost.quicknovel.extensions
+
+import com.lagradost.quicknovel.ReleaseStatus
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+
+class ExtensionResponseMapperTest {
+    @Test
+    fun searchResultsResolveRelativeUrlsAndSkipInvalidEntries() {
+        val json = """
+            [
+              {
+                "title": "Novel One",
+                "url": "/series/one",
+                "posterUrl": "/images/one.jpg",
+                "latestChapter": "Chapter 12"
+              },
+              {
+                "title": "Bad URL",
+                "url": "javascript:alert(1)"
+              },
+              {
+                "title": "Missing URL"
+              },
+              {
+                "title": "Unsafe poster",
+                "url": "/series/three",
+                "posterUrl": "javascript:alert(1)"
+              },
+              {
+                "title": "Novel Two",
+                "url": "https://reader.example/series/two"
+              }
+            ]
+        """.trimIndent()
+
+        val results = ExtensionResponseMapper.parseSearchResults(
+            json = json,
+            apiName = "Test provider",
+            baseUrl = "https://reader.example/catalog/",
+        )
+
+        assertEquals(3, results.size)
+        assertEquals("Novel One", results[0].name)
+        assertEquals("https://reader.example/series/one", results[0].url)
+        assertEquals("https://reader.example/images/one.jpg", results[0].posterUrl)
+        assertEquals("Chapter 12", results[0].latestChapter)
+        assertEquals("Test provider", results[0].apiName)
+        assertEquals("Unsafe poster", results[1].name)
+        assertEquals("https://reader.example/series/three", results[1].url)
+        assertNull(results[1].posterUrl)
+        assertEquals("Novel Two", results[2].name)
+        assertEquals("https://reader.example/series/two", results[2].url)
+        assertNull(results[2].posterUrl)
+    }
+
+    @Test
+    fun novelDetailsMapMetadataAndSkipInvalidChapters() {
+        val json = """
+            {
+              "title": "Example Novel",
+              "url": "/series/example",
+              "author": "A. Writer",
+              "posterUrl": "/cover.jpg",
+              "synopsis": "A short summary.",
+              "tags": ["Fantasy", "Adventure"],
+              "chapters": [
+                {"title": "Chapter 1", "url": "/chapter/1", "dateOfRelease": "2026-01-01"},
+                {"title": "Invalid", "url": "file:///etc/passwd"},
+                {"title": "Chapter 2", "url": "https://reader.example/chapter/2"}
+              ]
+            }
+        """.trimIndent()
+
+        val result = ExtensionResponseMapper.parseNovel(
+            json = json,
+            apiName = "Test provider",
+            baseUrl = "https://reader.example/",
+            requestedUrl = "https://reader.example/series/example",
+        )
+
+        assertEquals("Example Novel", result.name)
+        assertEquals("https://reader.example/series/example", result.url)
+        assertEquals("A. Writer", result.author)
+        assertEquals("https://reader.example/cover.jpg", result.posterUrl)
+        assertEquals("A short summary.", result.synopsis)
+        assertEquals(listOf("Fantasy", "Adventure"), result.tags)
+        assertEquals(2, result.data.size)
+        assertEquals("Chapter 1", result.data[0].name)
+        assertEquals("https://reader.example/chapter/1", result.data[0].url)
+        assertEquals("2026-01-01", result.data[0].dateOfRelease)
+        assertEquals("https://reader.example/chapter/2", result.data[1].url)
+    }
+
+    @Test
+    fun mapsObjectGenresAndReleaseStatusFromLnReaderResponses() {
+        val novel = ExtensionResponseMapper.parseNovel(
+            json = """{
+              "name":"Example","url":"/novel","status":"releasing",
+              "genres":[{"name":"Fantasy"},{"name":"Adventure"}],
+              "chapters":[{"name":"Chapter 1","path":"/chapter/1"}]
+            }""",
+            apiName = "Test provider",
+            baseUrl = "https://reader.example/",
+            requestedUrl = "https://reader.example/novel",
+        )
+        assertEquals(listOf("Fantasy", "Adventure"), novel.tags)
+        assertEquals(ReleaseStatus.Ongoing, novel.status)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun novelDetailsRejectMissingChapterList() {
+        ExtensionResponseMapper.parseNovel(
+            json = """{"title":"Incomplete","url":"/series/incomplete"}""",
+            apiName = "Test provider",
+            baseUrl = "https://reader.example/",
+            requestedUrl = "https://reader.example/series/incomplete",
+        )
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun searchResultsRejectMoreThanTheConfiguredLimit() {
+        val entries = (0..100).joinToString(
+            prefix = "[",
+            postfix = "]",
+        ) { index ->
+            """{"title":"Novel $index","url":"/novel/$index"}"""
+        }
+
+        ExtensionResponseMapper.parseSearchResults(
+            json = entries,
+            apiName = "Test provider",
+            baseUrl = "https://reader.example/",
+        )
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun novelDetailsRejectUnsafeNovelUrl() {
+        ExtensionResponseMapper.parseNovel(
+            json = """{"title":"Unsafe","url":"javascript:alert(1)","chapters":[]}""",
+            apiName = "Test provider",
+            baseUrl = "https://reader.example/",
+            requestedUrl = "https://reader.example/series/unsafe",
+        )
+    }
+
+    @Test
+    fun chapterUrlsWithUnsafeSchemesAreSkipped() {
+        val result = ExtensionResponseMapper.parseNovel(
+            json = """{"title":"Example","url":"/series/example","chapters":[{"title":"Unsafe","url":"file:///tmp/secret"},{"title":"Safe","url":"/chapter/1"}]}""",
+            apiName = "Test provider",
+            baseUrl = "https://reader.example/",
+            requestedUrl = "https://reader.example/series/example",
+        )
+        assertEquals(1, result.data.size)
+        assertEquals("Safe", result.data.single().name)
+    }
+    @Test
+    fun mapsRealLnReaderNamePathCoverAndChapterFields() {
+        val search = ExtensionResponseMapper.parseSearchResults(
+            json = """[{"name":"Chikari Story","path":"story-slug","cover":"https://chikari.moe/cover.jpg"}]""",
+            apiName = "Chikari",
+            baseUrl = "https://chikari.moe/",
+        )
+        assertEquals("Chikari Story", search.single().name)
+        assertEquals("https://chikari.moe/story-slug", search.single().url)
+        assertEquals("https://chikari.moe/cover.jpg", search.single().posterUrl)
+
+        val novel = ExtensionResponseMapper.parseNovel(
+            json = """{
+              "path":"story-slug","name":"Chikari Story","cover":"/cover.jpg",
+              "author":"Writer","summary":"Summary","genres":"Fantasy, Adventure",
+              "chapters":[{"name":"Chapter 1","path":"api/novels/story-slug/chapters/1/read","releaseTime":"2026-10-01"}]
+            }""",
+            apiName = "Chikari",
+            baseUrl = "https://chikari.moe/",
+            requestedUrl = "https://chikari.moe/novels/story-slug",
+        )
+        assertEquals("Chikari Story", novel.name)
+        assertEquals("https://chikari.moe/story-slug", novel.url)
+        assertEquals("Summary", novel.synopsis)
+        assertEquals(listOf("Fantasy", "Adventure"), novel.tags)
+        assertEquals("https://chikari.moe/api/novels/story-slug/chapters/1/read", novel.data.single().url)
+        assertEquals("2026-10-01", novel.data.single().dateOfRelease)
+    }
+
+}

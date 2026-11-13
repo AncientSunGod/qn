@@ -1,0 +1,743 @@
+package com.lagradost.quicknovel.extensions
+
+import android.content.Context as AndroidContext
+import org.json.JSONArray
+import org.json.JSONObject
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import org.jsoup.nodes.Node
+import org.jsoup.nodes.TextNode
+import org.jsoup.nodes.DataNode
+import org.mozilla.javascript.BaseFunction
+import org.mozilla.javascript.Context
+import org.mozilla.javascript.ContextFactory
+import org.mozilla.javascript.Scriptable
+import org.mozilla.javascript.ScriptableObject
+import java.io.File
+import java.net.URI
+
+/**
+ * Partial CommonJS-style JavaScript runtime for LNReader extension bundles.
+ *
+ * This is an in-process compatibility layer, not a security sandbox. It exposes a narrow,
+ * bounded host bridge for networking and HTML selection; unknown imports fail closed rather
+ * than being silently replaced with fake implementations. Arbitrary third-party bundles
+ * should not be treated as safe until execution is moved to a genuinely isolated runtime.
+ */
+object ExtensionJsRuntime {
+    private const val MAX_SOURCE_BYTES = 8 * 1024 * 1024
+    private const val MAX_ARGUMENT_BYTES = 256 * 1024
+    private const val MAX_RESULT_BYTES = 2 * 1024 * 1024
+    private const val MAX_INSTRUCTIONS = 2_000_000
+    private const val OBSERVER_THRESHOLD = 10_000
+    private val allowedOperations = setOf(
+        "searchNovels",
+        "parseNovel",
+        "parseChapter",
+        "popularNovels",
+        "parsePage",
+        "resolveUrl",
+    )
+
+    data class ExecutionResult(val json: String)
+
+    internal fun execute(
+        extension: InstalledExtension,
+        operation: String,
+        argumentsJson: String,
+        testFetchOverride: ((String) -> ExtensionHttpClient.TextResponse)? = null,
+        storageContext: AndroidContext? = null,
+    ): Result<ExecutionResult> = runCatching {
+        require(operation in allowedOperations) { "Unsupported extension operation." }
+        require(argumentsJson.toByteArray(Charsets.UTF_8).size <= MAX_ARGUMENT_BYTES) {
+            "Extension arguments exceed the size limit."
+        }
+        val arguments = JSONArray(argumentsJson)
+        val sourceFile = File(extension.bundlePath)
+        require(sourceFile.isFile) { "Extension bundle is missing." }
+        require(sourceFile.length() in 1..MAX_SOURCE_BYTES.toLong()) {
+            "Extension bundle is empty or exceeds the 8 MB limit."
+        }
+        val source = sourceFile.readText(Charsets.UTF_8)
+        require(source.isNotBlank()) { "Extension bundle is empty." }
+
+        val factory = BudgetedContextFactory(MAX_INSTRUCTIONS)
+        val output = factory.call { cx ->
+            cx.optimizationLevel = -1
+            cx.languageVersion = Context.VERSION_ES6
+            cx.instructionObserverThreshold = OBSERVER_THRESHOLD
+            cx.setClassShutter { false }
+
+            val scope = cx.initSafeStandardObjects()
+            ScriptableObject.putProperty(scope, "module", cx.newObject(scope).apply {
+                put("exports", this, cx.newObject(scope))
+            })
+            ScriptableObject.putProperty(scope, "exports", ScriptableObject.getProperty(
+                ScriptableObject.getProperty(scope, "module") as Scriptable,
+                "exports"
+            ))
+            val approvedHost = URI(extension.site).host?.lowercase()?.trimEnd('.')
+                ?: throw IllegalArgumentException("Extension site URL is invalid.")
+            var fetchCount = 0
+            val fetchFunction = object : BaseFunction() {
+                override fun call(
+                    context: Context,
+                    callScope: Scriptable,
+                    thisObj: Scriptable,
+                    args: Array<out Any>,
+                ): Any {
+                    fetchCount += 1
+                    require(fetchCount <= 20) { "Extension exceeded the 20-request operation limit." }
+                    val requestedUrl = args.firstOrNull()?.toString().orEmpty()
+                    require(requestedUrl.isNotBlank()) { "Extension fetch URL is missing." }
+                    val headersJson = args.getOrNull(1)?.toString().orEmpty()
+                    val requestHeaders = runCatching {
+                        val json = JSONObject(headersJson)
+                        buildMap {
+                            val keys = json.keys()
+                            while (keys.hasNext()) {
+                                val key = keys.next()
+                                put(key, json.optString(key, ""))
+                            }
+                        }
+                    }.getOrDefault(emptyMap())
+                    val response = testFetchOverride?.invoke(requestedUrl) ?: ExtensionHttpClient.getText(
+                        requestedUrl,
+                        headers = requestHeaders,
+                        allowedHosts = setOf(approvedHost),
+                    ).getOrThrow()
+                    return JSONObject()
+                        .put("url", response.url)
+                        .put("statusCode", response.statusCode)
+                        .put("contentType", response.contentType)
+                        .put("body", response.body)
+                        .toString()
+                }
+            }
+            fetchFunction.parentScope = scope
+            fetchFunction.prototype = ScriptableObject.getFunctionPrototype(scope)
+            ScriptableObject.putProperty(scope, "__qnFetch", fetchFunction)
+            val htmlBridge = HtmlBridge(extension.site)
+            val htmlFunction = object : BaseFunction() {
+                override fun call(
+                    context: Context,
+                    callScope: Scriptable,
+                    thisObj: Scriptable,
+                    args: Array<out Any>,
+                ): Any {
+                    val command = args.getOrNull(0)?.toString().orEmpty()
+                    val selectionId = args.getOrNull(1)?.toString()?.toIntOrNull() ?: 0
+                    val value = args.getOrNull(2)?.toString()
+                    val index = args.getOrNull(3)?.toString()?.toIntOrNull()
+                    return htmlBridge.invoke(command, selectionId, value, index)
+                }
+            }
+            htmlFunction.parentScope = scope
+            htmlFunction.prototype = ScriptableObject.getFunctionPrototype(scope)
+            ScriptableObject.putProperty(scope, "__qnHtml", htmlFunction)
+            val htmlEventsFunction = object : BaseFunction() {
+                override fun call(
+                    context: Context,
+                    callScope: Scriptable,
+                    thisObj: Scriptable,
+                    args: Array<out Any>,
+                ): Any {
+                    return htmlBridge.parseEvents(args.firstOrNull()?.toString().orEmpty())
+                }
+            }
+            htmlEventsFunction.parentScope = scope
+            htmlEventsFunction.prototype = ScriptableObject.getFunctionPrototype(scope)
+            ScriptableObject.putProperty(scope, "__qnHtmlEvents", htmlEventsFunction)
+            val storageFunction = object : BaseFunction() {
+                override fun call(
+                    context: Context,
+                    callScope: Scriptable,
+                    thisObj: Scriptable,
+                    args: Array<out Any>,
+                ): Any {
+                    val command = args.getOrNull(0)?.toString().orEmpty()
+                    val key = args.getOrNull(1)?.toString().orEmpty()
+                    val rawValue = args.getOrNull(2)?.toString().orEmpty()
+                    val expires = args.getOrNull(3)?.toString()?.toLongOrNull()
+                    val raw = args.getOrNull(4)?.toString().equals("true", ignoreCase = true)
+                    val prefs = storageContext?.getSharedPreferences(
+                        "quicknovel_extension_storage_${extension.id}",
+                        AndroidContext.MODE_PRIVATE,
+                    ) ?: throw IllegalStateException("Extension storage requires an app context.")
+                    val prefix = "entry_"
+                    val output = when (command) {
+                        "set" -> {
+                            require(key.length <= 500) { "Extension storage key is too long." }
+                            require(rawValue.length <= 100_000) { "Extension storage value is too large." }
+                            val storedValue = runCatching { org.json.JSONTokener(rawValue).nextValue() }.getOrNull()
+                            val envelope = JSONObject()
+                                .put("created", System.currentTimeMillis())
+                                .put("value", storedValue)
+                            if (expires != null) envelope.put("expires", expires)
+                            require(prefix + key in prefs.all.keys || prefs.all.keys.count { it.startsWith(prefix) } < 500) {
+                                "Extension storage exceeded the 500-key limit."
+                            }
+                            val currentSize = prefs.all.entries
+                                .filter { it.key.startsWith(prefix) }
+                                .sumOf { it.value.toString().length }
+                            val previousSize = prefs.getString(prefix + key, null)?.length ?: 0
+                            require(currentSize - previousSize + envelope.toString().length <= 2_097_152) {
+                                "Extension storage exceeded the 2 MB limit."
+                            }
+                            prefs.edit().putString(prefix + key, envelope.toString()).apply()
+                            "null"
+                        }
+                        "get" -> {
+                            require(key.length <= 500) { "Extension storage key is too long." }
+                            val stored = prefs.getString(prefix + key, null)
+                            if (stored == null) "null" else {
+                                val envelope = JSONObject(stored)
+                                val expiry = envelope.optLong("expires", 0L)
+                                if (expiry > 0L && System.currentTimeMillis() >= expiry) {
+                                    prefs.edit().remove(prefix + key).apply()
+                                    "null"
+                                } else if (raw) envelope.toString()
+                                else {
+                                    val stored = envelope.opt("value")
+                                    if (stored == null) "null"
+                                    else if (stored is JSONObject || stored is JSONArray) stored.toString()
+                                    else if (stored is String) JSONObject.quote(stored)
+                                    else stored.toString()
+                                }
+                            }
+                        }
+                        "delete" -> {
+                            prefs.edit().remove(prefix + key).apply()
+                            "null"
+                        }
+                        "clearAll" -> {
+                            prefs.all.keys.filter { it.startsWith(prefix) }.forEach { prefs.edit().remove(it).apply() }
+                            "null"
+                        }
+                        "getAllKeys" -> JSONArray(prefs.all.keys.filter { it.startsWith(prefix) }.map { it.removePrefix(prefix) }).toString()
+                        else -> throw IllegalArgumentException("Unsupported extension storage operation.")
+                    }
+                    return output
+                }
+            }
+            storageFunction.parentScope = scope
+            storageFunction.prototype = ScriptableObject.getFunctionPrototype(scope)
+            ScriptableObject.putProperty(scope, "__qnStorage", storageFunction)
+            val compatibilityBootstrap = """
+                (function() {
+                  function QNPromise(executor) {
+                    var self = this;
+                    self.state = 0; self.value = void 0; self.handlers = [];
+                    function settle(state, value) {
+                      if (self.state !== 0) return;
+                      if (value === self) return settle(2, new TypeError('Promise cycle'));
+                      if (value && typeof value.then === 'function') {
+                        try { return value.then(resolve, reject); } catch (e) { return reject(e); }
+                      }
+                      self.state = state; self.value = value;
+                      self.handlers.forEach(run);
+                    }
+                    function resolve(value) { settle(1, value); }
+                    function reject(error) { settle(2, error); }
+                    function run(handler) {
+                      var callback = self.state === 1 ? handler.ok : handler.fail;
+                      if (typeof callback !== 'function') {
+                        (self.state === 1 ? handler.resolve : handler.reject)(self.value); return;
+                      }
+                      try { handler.resolve(callback(self.value)); } catch (e) { handler.reject(e); }
+                    }
+                    self.then = function(ok, fail) {
+                      return new QNPromise(function(resolveNext, rejectNext) {
+                        var handler = {ok:ok, fail:fail, resolve:resolveNext, reject:rejectNext};
+                        if (self.state === 0) self.handlers.push(handler); else run(handler);
+                      });
+                    };
+                    self.catch = function(fail) { return self.then(null, fail); };
+                    try { executor(resolve, reject); } catch (e) { reject(e); }
+                  }
+                  QNPromise.resolve = function(value) {
+                    return new QNPromise(function(resolve) { resolve(value); });
+                  };
+                  QNPromise.reject = function(error) {
+                    return new QNPromise(function(resolve, reject) { reject(error); });
+                  };
+                  QNPromise.all = function(values) {
+                    return new QNPromise(function(resolve, reject) {
+                      if (!values || typeof values.length !== 'number')
+                        return reject(new TypeError('Promise.all expects an array-like value'));
+                      var length = values.length, remaining = length, results = [];
+                      if (length === 0) return resolve(results);
+                      for (var i = 0; i < length; i++) (function(index) {
+                        QNPromise.resolve(values[index]).then(function(value) {
+                          results[index] = value;
+                          remaining--;
+                          if (remaining === 0) resolve(results);
+                        }, reject);
+                      })(i);
+                    });
+                  };
+                  this.Promise = QNPromise;
+                  this.require = function(name) {
+                    if (name === '@libs/fetch') return {
+                      fetchApi: function(url, init) {
+                        if (init && init.method && String(init.method).toUpperCase() !== 'GET')
+                          throw new Error('Only GET requests are supported by this extension bridge.');
+                        var headers = init && init.headers ? init.headers : {};
+                        if (headers && typeof headers.forEach === 'function') {
+                          var normalized = {};
+                          headers.forEach(function(value, key) { normalized[key] = value; });
+                          headers = normalized;
+                        }
+                        return Promise.resolve(JSON.parse(__qnFetch(String(url), JSON.stringify(headers)))).then(function(r) {
+                          return {
+                            url: r.url, status: r.statusCode, ok: r.statusCode >= 200 && r.statusCode < 300,
+                            statusText: String(r.statusCode), body: r.body,
+                            text: function() { return Promise.resolve(r.body); },
+                            json: function() { return Promise.resolve(JSON.parse(r.body)); },
+                            headers: { get: function(key) {
+                              return String(key).toLowerCase() === 'content-type' ? r.contentType : null;
+                            } }
+                          };
+                        });
+                      },
+                      fetchText: function(url, init) {
+                        try {
+                          return this.fetchApi(url, init).then(function(response) {
+                            return response.ok ? response.text() : '';
+                          }).catch(function() { return ''; });
+                        } catch (error) {
+                          return Promise.resolve('');
+                        }
+                      }
+                    };
+                    if (name === 'cheerio') {
+                      function call(command, id, value, index) {
+                        return JSON.parse(__qnHtml(command, id, value == null ? '' : String(value), index == null ? '' : index));
+                      }
+                      function wrap(id) {
+                        var selection = {_qnSelectionId:id};
+                        Object.defineProperty(selection, 'length', {get:function(){return call('length',id);}});
+                        selection.text = function(){return call('text',id);};
+                        selection.html = function(){return call('html',id);};
+                        selection.attr = function(name){return call('attr',id,name);};
+                        selection.hasClass = function(name){return call('hasClass',id,name);};
+                        selection.first = function(){return wrap(call('first',id));};
+                        selection.last = function(){return wrap(call('last',id));};
+                        selection.eq = function(index){return wrap(call('eq',id,'',index));};
+                        selection.find = function(selector){return wrap(call('find',id,selector));};
+                        selection.children = function(selector){return wrap(call('children',id,selector || ''));};
+                        selection.parent = function(){return wrap(call('parent',id));};
+                        selection.next = function(){return wrap(call('next',id));};
+                        selection.prev = function(){return wrap(call('prev',id));};
+                        selection.remove = function(){call('remove',id);return selection;};
+                        selection.each = function(callback) {
+                          for (var i=0;i<selection.length;i++) {
+                            var item=selection.eq(i);
+                            callback.call(item,i,item);
+                          }
+                          return selection;
+                        };
+                        selection.map = function(callback) {
+                          var values=[];
+                          for (var i=0;i<selection.length;i++) values.push(callback.call(selection.eq(i),i,selection.eq(i)));
+                          return {get:function(){return values;},toArray:function(){return values;}};
+                        };
+                        selection.get = function(index) {
+                          if (index == null) { var all=[]; for(var i=0;i<selection.length;i++) all.push(selection.eq(i)); return all; }
+                          return selection.eq(index);
+                        };
+                        return selection;
+                      }
+                      function load(html) {
+                        var root = call('load',0,String(html == null ? '' : html));
+                        function $(selector) {
+                          if (selector && selector._qnSelectionId != null) return selector;
+                          return wrap(call('select',root,typeof selector === 'string' ? selector : '*'));
+                        }
+                        $.root = function(){return wrap(root);};
+                        $.html = function(){return call('html',root);};
+                        $.text = function(){return call('text',root);};
+                        return $;
+                      }
+                      return {load:load,default:{load:load}};
+                    }
+                    if (name === 'htmlparser2') {
+                      function Parser(handlers, options) {
+                        this.handlers = handlers || {};
+                        this.source = '';
+                      }
+                      Parser.prototype.write = function(chunk) {
+                        this.source += String(chunk == null ? '' : chunk);
+                        return this;
+                      };
+                      Parser.prototype.end = function(chunk) {
+                        if (chunk != null) this.source += String(chunk);
+                        var events = JSON.parse(__qnHtmlEvents(this.source));
+                        for (var i=0;i<events.length;i++) {
+                          var event = events[i];
+                          var handlerName = event.type === 'open' ? 'onopentag' :
+                            event.type === 'text' ? 'ontext' : 'onclosetag';
+                          var handler = this.handlers[handlerName];
+                          if (typeof handler !== 'function') continue;
+                          if (event.type === 'open') handler.call(this.handlers,event.name,event.attribs);
+                          else if (event.type === 'text') handler.call(this.handlers,event.text);
+                          else if (event.type === 'close') handler.call(this.handlers,event.name);
+                        }
+                        this.source = '';
+                        return this;
+                      };
+                      return {Parser:Parser,default:{Parser:Parser}};
+                    }
+                    if (name === '@libs/storage') {
+                      function call(command, key, value, expires, raw) {
+                        return JSON.parse(__qnStorage(command, String(key == null ? '' : key),
+                          value == null ? '' : String(value), expires == null ? '' : String(expires), raw ? 'true' : 'false'));
+                      }
+                      var storage = {
+                        set: function(key, value, expires) {
+                          var expiry = expires instanceof Date ? expires.getTime() : expires;
+                          return call('set', key, JSON.stringify(value), expiry, false);
+                        },
+                        get: function(key, raw) {
+                          var value = call('get', key, '', '', raw);
+                          return value === null ? undefined : value;
+                        },
+                        delete: function(key) { return call('delete', key); },
+                        clearAll: function() { return call('clearAll'); },
+                        getAllKeys: function() { return call('getAllKeys'); }
+                      };
+                      var readOnlyStorage = {get:function(){return undefined;}};
+                      return {storage:storage,localStorage:readOnlyStorage,sessionStorage:readOnlyStorage};
+                    }
+                    if (name === 'dayjs') {
+                      var months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+                      var shortMonths = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                      function parseDate(input, format) {
+                        if (input == null || input === '') return input == null ? new Date() : new Date(NaN);
+                        if (input instanceof Date) return new Date(input.getTime());
+                        if (typeof input === 'number') return new Date(input);
+                        var text = String(input);
+                        if (format === 'DD.MM.YYYY') {
+                          var match = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+                          if (!match) return new Date(NaN);
+                          return new Date(Number(match[3]), Number(match[2])-1, Number(match[1]));
+                        }
+                        return new Date(text);
+                      }
+                      function makeDate(date) {
+                        function valid() { return !isNaN(date.getTime()); }
+                        function pad(value) { return value < 10 ? '0' + value : String(value); }
+                        function unitName(unit) {
+                          var original = String(unit || 'millisecond');
+                          if (original === 'M' || original.toLowerCase().indexOf('month') === 0) return 'month';
+                          unit = original.toLowerCase();
+                          if (unit === 'd' || unit.indexOf('day') === 0) return 'day';
+                          if (unit === 'h' || unit.indexOf('hour') === 0) return 'hour';
+                          if (unit === 'm' || unit.indexOf('minute') === 0) return 'minute';
+                          if (unit === 's' || unit.indexOf('second') === 0) return 'second';
+                          if (unit === 'w' || unit.indexOf('week') === 0) return 'week';
+                          if (unit === 'y' || unit.indexOf('year') === 0) return 'year';
+                          return 'millisecond';
+                        }
+                        var api = {
+                          isValid: valid,
+                          valueOf: function() { return date.getTime(); },
+                          unix: function() { return Math.floor(date.getTime()/1000); },
+                          toDate: function() { return new Date(date.getTime()); },
+                          toISOString: function() { return valid() ? date.toISOString() : null; },
+                          date: function() { return date.getDate(); },
+                          month: function() { return date.getMonth(); },
+                          year: function() { return date.getFullYear(); },
+                          format: function(pattern) {
+                            if (!valid()) return 'Invalid Date';
+                            pattern = pattern || 'YYYY-MM-DDTHH:mm:ssZ';
+                            if (pattern === 'LL') pattern = 'MMMM D, YYYY';
+                            if (pattern === 'LLL') pattern = 'MMMM D, YYYY h:mm A';
+                            var hour = date.getHours(), offset = -date.getTimezoneOffset();
+                            var zone = (offset >= 0 ? '+' : '-') + pad(Math.floor(Math.abs(offset)/60)) + ':' + pad(Math.abs(offset)%60);
+                            var values = {
+                              YYYY:String(date.getFullYear()), YY:String(date.getFullYear()).slice(-2),
+                              MMMM:months[date.getMonth()], MMM:shortMonths[date.getMonth()],
+                              MM:pad(date.getMonth()+1), M:String(date.getMonth()+1),
+                              DD:pad(date.getDate()), D:String(date.getDate()),
+                              HH:pad(hour), H:String(hour), hh:pad(hour%12 || 12), h:String(hour%12 || 12),
+                              mm:pad(date.getMinutes()), m:String(date.getMinutes()),
+                              ss:pad(date.getSeconds()), s:String(date.getSeconds()),
+                              A:hour < 12 ? 'AM' : 'PM', a:hour < 12 ? 'am' : 'pm', Z:zone
+                            };
+                            return pattern.replace(/YYYY|MMMM|MMM|YY|MM|M|DD|D|HH|H|hh|h|mm|m|ss|s|A|a|Z/g, function(token) { return values[token]; });
+                          },
+                          add: function(amount, unit) {
+                            var copy = new Date(date.getTime()), n = Number(amount), u = unitName(unit);
+                            if (u === 'year' || u === 'month') {
+                              // Day.js clamps calendar arithmetic to the last valid day
+                              // (e.g. Jan 31 + 1 month becomes Feb 28/29, not March).
+                              var monthsToAdd = Math.round(u === 'year' ? n * 12 : n);
+                              var originalDay = copy.getDate();
+                              copy.setDate(1);
+                              copy.setMonth(copy.getMonth()+monthsToAdd);
+                              var lastDay = new Date(copy.getFullYear(), copy.getMonth()+1, 0).getDate();
+                              copy.setDate(Math.min(originalDay,lastDay));
+                            }
+                            else if (u === 'week') copy.setDate(copy.getDate()+n*7);
+                            else if (u === 'day') copy.setDate(copy.getDate()+n);
+                            else if (u === 'hour') copy.setHours(copy.getHours()+n);
+                            else if (u === 'minute') copy.setMinutes(copy.getMinutes()+n);
+                            else if (u === 'second') copy.setSeconds(copy.getSeconds()+n);
+                            else copy.setTime(copy.getTime()+n);
+                            return makeDate(copy);
+                          },
+                          subtract: function(amount, unit) { return api.add(-Number(amount), unit); },
+                          startOf: function(unit) {
+                            var copy = new Date(date.getTime()), u = unitName(unit);
+                            if (u === 'year') { copy.setMonth(0); copy.setDate(1); copy.setHours(0,0,0,0); }
+                            else if (u === 'month') { copy.setDate(1); copy.setHours(0,0,0,0); }
+                            else if (u === 'week') {
+                              copy.setDate(copy.getDate()-copy.getDay());
+                              copy.setHours(0,0,0,0);
+                            }
+                            else if (u === 'day') copy.setHours(0,0,0,0);
+                            else if (u === 'hour') copy.setMinutes(0,0,0);
+                            else if (u === 'minute') copy.setSeconds(0,0);
+                            else if (u === 'second') copy.setMilliseconds(0);
+                            return makeDate(copy);
+                          },
+                          endOf: function(unit) {
+                            var u = unitName(unit), next = api.startOf(unit).add(1, unit);
+                            return makeDate(new Date(next.valueOf()-1));
+                          },
+                          diff: function(other, unit) {
+                            var otherDate = parseDate(other), delta = date.getTime() - otherDate.getTime(), u = unitName(unit);
+                            if (u === 'month' || u === 'year') {
+                              var months = (date.getFullYear()-otherDate.getFullYear())*12 +
+                                (date.getMonth()-otherDate.getMonth());
+                              var candidate = new Date(otherDate.getTime());
+                              var originalDay = candidate.getDate();
+                              candidate.setDate(1);
+                              candidate.setMonth(candidate.getMonth()+months);
+                              var lastDay = new Date(candidate.getFullYear(), candidate.getMonth()+1, 0).getDate();
+                              candidate.setDate(Math.min(originalDay,lastDay));
+                              if (delta >= 0 && candidate.getTime() > date.getTime()) months--;
+                              else if (delta < 0 && candidate.getTime() < date.getTime()) months++;
+                              return Math.trunc(u === 'year' ? months/12 : months);
+                            }
+                            var divisor = u === 'week' ? 604800000 : u === 'day' ? 86400000 : u === 'hour' ? 3600000 : u === 'minute' ? 60000 : u === 'second' ? 1000 : 1;
+                            return Math.trunc(delta/divisor);
+                          },
+                          isBefore: function(other) { return date.getTime() < parseDate(other).getTime(); },
+                          isAfter: function(other) { return date.getTime() > parseDate(other).getTime(); },
+                          isSame: function(other) { return date.getTime() === parseDate(other).getTime(); }
+                        };
+                        return api;
+                      }
+                      function dayjs(input, format) { return makeDate(parseDate(input, format)); }
+                      dayjs.default = dayjs;
+                      return dayjs;
+                    }
+                    if (name === '@libs/isAbsoluteUrl') return {
+                      isUrlAbsolute: function(url) { return /^https?:\/\//i.test(String(url)); }
+                    };
+                    if (name === 'urlencode') {
+                      var urlencode = {
+                        encode: function(value) { return encodeURIComponent(String(value)); },
+                        decode: function(value) { return decodeURIComponent(String(value)); }
+                      };
+                      urlencode.default = urlencode;
+                      return urlencode;
+                    }
+                    if (name === '@libs/defaultCover') return {defaultCover: ''};
+                    if (name === '@libs/novelStatus') return {
+                      NovelStatus: {Ongoing:'ongoing', Completed:'completed', Paused:'paused', Dropped:'dropped'}
+                    };
+                    if (name === '@libs/filterInputs') return {
+                      FilterTypes: {
+                        Picker:'Picker', CheckboxGroup:'CheckboxGroup',
+                        ExcludableCheckboxGroup:'ExcludableCheckboxGroup',
+                        Switch:'Switch', TextInput:'TextInput', Input:'Input'
+                      }
+                    };
+                    throw new Error("Unsupported LNReader module import: " + name);
+                  };
+                }).call(this);
+            """.trimIndent()
+            cx.evaluateString(scope, compatibilityBootstrap, "qn-compatibility.js", 1, null)
+
+
+            cx.evaluateString(scope, source, "extension-${extension.id}.js", 1, null)
+            ScriptableObject.putProperty(scope, "__qnOperation", operation)
+            ScriptableObject.putProperty(scope, "__qnArgumentsJson", arguments.toString())
+            val invocation = """
+                (function() {
+                  var exported = module.exports;
+                  var plugin = exported && (exported.default || exported);
+                  if (!plugin || typeof plugin[__qnOperation] !== 'function') {
+                    throw new Error('Bundle does not export operation: ' + __qnOperation);
+                  }
+                  var args = JSON.parse(__qnArgumentsJson);
+                  if (__qnOperation === 'popularNovels' && args[1] && args[1].filters &&
+                      Object.keys(args[1].filters).length === 0) {
+                    args[1].filters = plugin.filters || {};
+                  }
+                  var result = plugin[__qnOperation].apply(plugin, args);
+                  if (result && typeof result.then === 'function') {
+                    var resolved = false, rejected = null;
+                    result.then(function(value) { result = value; resolved = true; },
+                                function(error) { rejected = error; });
+                    if (rejected) throw rejected;
+                    if (!resolved) throw new Error('Extension operation did not resolve synchronously.');
+                  }
+                  return JSON.stringify(result === undefined ? null : result);
+                })()
+            """.trimIndent()
+            val result = cx.evaluateString(scope, invocation, "extension-call.js", 1, null)
+            Context.toString(result)
+        }
+        require(output.toByteArray(Charsets.UTF_8).size <= MAX_RESULT_BYTES) {
+            "Extension result exceeds the 2 MB limit."
+        }
+        // Ensure the operation produced valid JSON before it crosses into app models.
+        val parsedResult = org.json.JSONTokener(output).nextValue()
+        require(parsedResult != null) { "Extension returned invalid JSON." }
+        ExecutionResult(output)
+    }
+
+    /**
+     * Small Cheerio-compatible selector surface backed by Jsoup. Only bounded HTML and CSS
+     * selectors cross the bridge; Java objects are never exposed to the JavaScript scope.
+     */
+    private class HtmlBridge(private val baseUrl: String) {
+        private val maxHtmlChars = 2 * 1024 * 1024
+        private val maxSelectorChars = 500
+        private val maxResults = 1_000
+        private val maxDocuments = 20
+        private val maxSelections = 2_000
+        private var nextId = 1
+        private val documents = mutableMapOf<Int, Document>()
+        private val selections = mutableMapOf<Int, List<Element>>()
+
+        fun parseEvents(html: String): String {
+            require(html.length <= maxHtmlChars) { "HTML input exceeds the 2 MB limit." }
+            val document = Jsoup.parse(html, baseUrl)
+            val events = JSONArray()
+            var visited = 0
+            fun walk(node: Node, depth: Int) {
+                visited++
+                require(visited <= 10_000) { "HTML parser exceeded the node limit." }
+                require(depth <= 256) { "HTML parser exceeded the nesting-depth limit." }
+                when (node) {
+                    is Document -> node.childNodes().forEach { walk(it, depth + 1) }
+                    is Element -> {
+                        val attributes = JSONObject()
+                        node.attributes().asList().take(100).forEach { attribute ->
+                            attributes.put(attribute.key.take(100), attribute.value.take(10_000))
+                        }
+                        events.put(JSONObject().put("type", "open").put("name", node.tagName()).put("attribs", attributes))
+                        node.childNodes().forEach { walk(it, depth + 1) }
+                        events.put(JSONObject().put("type", "close").put("name", node.tagName()))
+                    }
+                    is TextNode -> events.put(JSONObject().put("type", "text").put("text", node.getWholeText().take(100_000)))
+                    is DataNode -> events.put(JSONObject().put("type", "text").put("text", node.getWholeData().take(100_000)))
+                    else -> node.childNodes().forEach { walk(it, depth + 1) }
+                }
+                require(events.length() <= 20_000) { "HTML parser exceeded the event limit." }
+            }
+            walk(document, 0)
+            val result = events.toString()
+            require(result.toByteArray(Charsets.UTF_8).size <= 2 * 1024 * 1024) {
+                "HTML parser output exceeds the 2 MB limit."
+            }
+            return result
+        }
+
+        fun invoke(command: String, selectionId: Int, value: String?, index: Int?): String {
+            val result: Any? = when (command) {
+                "load" -> {
+                    val html = value.orEmpty()
+                    require(html.length <= maxHtmlChars) { "HTML input exceeds the 2 MB limit." }
+                    require(documents.size < maxDocuments) { "Extension exceeded the HTML document limit." }
+                    val id = nextId++
+                    documents[id] = Jsoup.parse(html, baseUrl)
+                    id
+                }
+                "select" -> {
+                    val selector = value.orEmpty()
+                    require(selector.isNotBlank() && selector.length <= maxSelectorChars) {
+                        "CSS selector is empty or too long."
+                    }
+                    val found = documents[selectionId]?.select(selector)
+                        ?: selections[selectionId].orEmpty().flatMap { parent ->
+                            parent.select(selector).filterNot { it === parent }
+                        }
+                    store(found)
+                }
+                "find" -> {
+                    val selector = value.orEmpty()
+                    require(selector.isNotBlank() && selector.length <= maxSelectorChars) {
+                        "CSS selector is empty or too long."
+                    }
+                    store(selections[selectionId].orEmpty().flatMap { parent ->
+                        parent.select(selector).filterNot { it === parent }
+                    })
+                }
+                "children" -> {
+                    val selector = value.orEmpty()
+                    require(selector.length <= maxSelectorChars) { "CSS selector is too long." }
+                    val children = selections[selectionId].orEmpty().flatMap { it.children() }
+                    store(if (selector.isBlank()) children else children.filter { it.`is`(selector) })
+                }
+                "parent" -> store(selections[selectionId].orEmpty().mapNotNull { it.parent() }.distinct())
+                "next" -> store(selections[selectionId].orEmpty().mapNotNull { it.nextElementSibling() })
+                "prev" -> store(selections[selectionId].orEmpty().mapNotNull { it.previousElementSibling() })
+                "first" -> store(selections[selectionId].orEmpty().take(1))
+                "last" -> store(selections[selectionId].orEmpty().takeLast(1))
+                "eq" -> {
+                    val elements = selections[selectionId].orEmpty()
+                    val requested = index ?: 0
+                    val resolved = if (requested < 0) elements.size + requested else requested
+                    store(elements.getOrNull(resolved)?.let { listOf(it) }.orEmpty())
+                }
+                "length" -> documents[selectionId]?.let { 1 } ?: selections[selectionId].orEmpty().size
+                "text" -> documents[selectionId]?.text()?.take(100_000)
+                    ?: selections[selectionId].orEmpty().joinToString("") { it.text() }.take(100_000)
+                "html" -> documents[selectionId]?.html()?.take(100_000)
+                    ?: selections[selectionId].orEmpty().firstOrNull()?.html()?.take(100_000).orEmpty()
+                "attr" -> selections[selectionId].orEmpty().firstOrNull()?.let { element ->
+                    value?.let { if (element.hasAttr(it)) element.attr(it).take(100_000) else null }
+                }
+                "hasClass" -> selections[selectionId].orEmpty().firstOrNull()?.hasClass(value.orEmpty()) ?: false
+                "remove" -> {
+                    selections[selectionId].orEmpty().forEach { it.remove() }
+                    selectionId
+                }
+                else -> throw IllegalArgumentException("Unsupported HTML selector operation.")
+            }
+            return when (result) {
+                null -> "null"
+                is String -> JSONObject.quote(result)
+                is Number, is Boolean -> result.toString()
+                else -> result.toString()
+            }
+        }
+
+        private fun store(elements: List<Element>): Int {
+            require(selections.size < maxSelections) { "Extension exceeded the HTML selection limit." }
+            val id = nextId++
+            selections[id] = elements.take(maxResults)
+            return id
+        }
+    }
+
+    private class BudgetedContextFactory(
+        private val instructionLimit: Int,
+    ) : ContextFactory() {
+        private var instructions = 0
+
+        override fun observeInstructionCount(cx: Context, instructionCount: Int) {
+            instructions += instructionCount
+            if (instructions > instructionLimit) {
+                throw IllegalStateException("Extension exceeded its JavaScript instruction budget.")
+            }
+        }
+    }
+}

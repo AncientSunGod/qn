@@ -1,0 +1,139 @@
+package com.lagradost.quicknovel.util
+
+import android.app.Activity
+import android.content.Context
+import android.net.Uri
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.module.kotlin.readValue
+import com.lagradost.quicknovel.BookDownloader2Helper.checkWrite
+import com.lagradost.quicknovel.BookDownloader2Helper.requestRW
+import com.lagradost.quicknovel.DataStore
+import com.lagradost.quicknovel.DataStore.getDefaultSharedPrefs
+import com.lagradost.quicknovel.DataStore.getSharedPrefs
+import com.lagradost.quicknovel.DataStore.mapper
+import com.lagradost.quicknovel.ErrorLoadingException
+import com.lagradost.quicknovel.FileHelper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.lang.System.currentTimeMillis
+import java.text.SimpleDateFormat
+import java.util.Date
+
+object BackupUtils {
+    // Kinda hack, but I couldn't think of a better way
+    data class BackupVars(
+        @JsonProperty("_Bool") val _Bool: Map<String, Boolean>?,
+        @JsonProperty("_Int") val _Int: Map<String, Int>?,
+        @JsonProperty("_String") val _String: Map<String, String>?,
+        @JsonProperty("_Float") val _Float: Map<String, Float>?,
+        @JsonProperty("_Long") val _Long: Map<String, Long>?,
+        @JsonProperty("_StringSet") val _StringSet: Map<String, Set<String>?>?,
+    )
+
+    data class BackupFile(
+        @JsonProperty("datastore") val datastore: BackupVars,
+        @JsonProperty("settings") val settings: BackupVars
+    )
+
+    private fun <T> Context.restoreMap(
+        map: Map<String, T>?,
+        isEditingAppSettings: Boolean = false
+    ) {
+        val editor = DataStore.editor(this, isEditingAppSettings)
+        map?.forEach {
+            editor.setKeyRaw(it.key, it.value)
+        }
+        editor.apply()
+    }
+
+    suspend fun restoreFromUri(context: Context, uri: Uri): Result<Unit> =
+        withContext(Dispatchers.Default) {
+            runCatching {
+                val restoredValue =
+                    context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                        mapper.readValue<BackupFile>(inputStream)
+                    } ?: return@runCatching
+                restore(
+                    context,
+                    restoredValue,
+                    restoreSettings = true,
+                    restoreDataStore = true
+                )
+            }
+        }
+
+    suspend fun createBackupFile(context: Context, activity: Activity?): Result<String> =
+        withContext(Dispatchers.Default) {
+            runCatching {
+                if (!context.checkWrite()) {
+                    activity?.requestRW()
+                    throw ErrorLoadingException()
+                }
+                val date = SimpleDateFormat("yyyy_MM_dd_HH_mm").format(Date(currentTimeMillis()))
+                val displayName = "QN_Backup_${date}"
+
+                val allData = context.getSharedPrefs().all
+                val allSettings = context.getDefaultSharedPrefs().all
+
+                val allDataSorted = BackupVars(
+                    allData.filter { it.value is Boolean } as? Map<String, Boolean>,
+                    allData.filter { it.value is Int } as? Map<String, Int>,
+                    allData.filter { it.value is String } as? Map<String, String>,
+                    allData.filter { it.value is Float } as? Map<String, Float>,
+                    allData.filter { it.value is Long } as? Map<String, Long>,
+                    allData.filter { it.value as? Set<String> != null } as? Map<String, Set<String>>
+                )
+
+                val allSettingsSorted = BackupVars(
+                    allSettings.filter { it.value is Boolean } as? Map<String, Boolean>,
+                    allSettings.filter { it.value is Int } as? Map<String, Int>,
+                    allSettings.filter { it.value is String } as? Map<String, String>,
+                    allSettings.filter { it.value is Float } as? Map<String, Float>,
+                    allSettings.filter { it.value is Long } as? Map<String, Long>,
+                    allSettings.filter { it.value as? Set<String> != null } as? Map<String, Set<String>>
+                )
+
+                val backupFile = BackupFile(
+                    allDataSorted,
+                    allSettingsSorted
+                )
+
+                val file = FileHelper.backup.createFile(context, displayName)
+                    ?: throw ErrorLoadingException("Unable to create file")
+                val stream = file.openOutputStream(append = false)
+                    ?: throw ErrorLoadingException("Unable to create stream")
+
+                stream.use { stream ->
+                    mapper.writeValue(stream, backupFile)
+                }
+                file.absolutePath ?: file.uri.toString()
+            }
+        }
+
+    fun restore(
+        context: Context,
+        backupFile: BackupFile,
+        restoreSettings: Boolean,
+        restoreDataStore: Boolean
+    ) {
+        context.apply {
+            if (restoreSettings) {
+                restoreMap(backupFile.settings._Bool, true)
+                restoreMap(backupFile.settings._Int, true)
+                restoreMap(backupFile.settings._String, true)
+                restoreMap(backupFile.settings._Float, true)
+                restoreMap(backupFile.settings._Long, true)
+                restoreMap(backupFile.settings._StringSet, true)
+            }
+
+            if (restoreDataStore) {
+                restoreMap(backupFile.datastore._Bool)
+                restoreMap(backupFile.datastore._Int)
+                restoreMap(backupFile.datastore._String)
+                restoreMap(backupFile.datastore._Float)
+                restoreMap(backupFile.datastore._Long)
+                restoreMap(backupFile.datastore._StringSet)
+            }
+        }
+    }
+}
