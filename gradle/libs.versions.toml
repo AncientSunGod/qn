@@ -3,7 +3,7 @@
 [versions]
 androidGradlePlugin = "9.1.0"
 coilComposeVersion = "3.5.0"
-kotlinGradlePlugin = "2.4.10"
+kotlinGradlePlugin = "2.4.21"
 kover = "0.9.11"
 
 activity = "1.13.0"
