@@ -13,7 +13,7 @@ kotlinxCollectionsImmutable = "0.5.1"
 kotlinxIoCore = "0.9.1"
 lifecycleViewmodelCompose = "2.11.0"
 preference = "2.2.0"
-navigationCompose = "2.9.8"
+navigationCompose = "2.10.2"
 uiText = "1.11.4"
 
 [libraries]
