@@ -1,0 +1,12 @@
+{
+  "name": "quicknovel",
+  "version": "3.8.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node preview-server.mjs",
+    "start": "node preview-server.mjs",
+    "build": "node --check preview-server.mjs",
+    "lint": "node --check preview-server.mjs"
+  }
+}

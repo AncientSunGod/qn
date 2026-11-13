@@ -24,6 +24,7 @@ import kotlinx.collections.immutable.PersistentList
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toPersistentList
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
@@ -54,7 +55,20 @@ data class FilterState(
     val error: Throwable? = null,
     val url: String = "",
     val query: FilterQuery = FilterQuery(),
+    val endReached: Boolean = false,
 )
+
+internal fun mergeMainPageItems(
+    existing: PersistentList<ImmutableSearchResponse>,
+    incoming: List<ImmutableSearchResponse>,
+): Pair<PersistentList<ImmutableSearchResponse>, Boolean> {
+    if (incoming.isEmpty()) return existing to true
+    val seenUrls = HashSet<String>(existing.size + incoming.size)
+    existing.forEach { seenUrls.add(it.url) }
+    val uniqueIncoming = incoming.filter { seenUrls.add(it.url) }
+    if (uniqueIncoming.isEmpty()) return existing to true
+    return existing.addingAll(uniqueIncoming) to false
+}
 
 @Immutable
 data class FilterQueryVisual(
@@ -88,6 +102,7 @@ sealed class MainPageAction {
 
     data class Search(val data: String) : MainPageAction()
     object Expand : MainPageAction()
+    object Refresh : MainPageAction()
     data class OpenInBrowser(val url: String) : MainPageAction()
     object Back : MainPageAction()
     object Dismiss : MainPageAction()
@@ -131,13 +146,34 @@ class MainPageViewModel2(
         }
     }
 
-    suspend fun expand() = withContext(Dispatchers.IO) {
-        val from = state.value.filter.query
-        val fromList = state.value.filter.items
+    suspend fun refresh() = withContext(Dispatchers.IO) {
+        // Reset pagination and stale results before requesting page one again.
+        updateState {
+            copy(
+                filter = filter.copy(
+                    query = filter.query.copy(page = 0),
+                    items = persistentListOf(),
+                    loading = false,
+                    error = null,
+                    url = "",
+                    endReached = false,
+                )
+            )
+        }
+        expand()
+    }
 
+    suspend fun expand() = withContext(Dispatchers.IO) {
+        val currentFilter = state.value.filter
+        if (currentFilter.endReached) return@withContext
+        val from = currentFilter.query
+        val fromList = currentFilter.items
+
+        var lockAcquired = false
         try {
             expandMutex.lock()
-            if (from != state.value.filter.query) return@withContext
+            lockAcquired = true
+            if (from != state.value.filter.query || state.value.filter.endReached) return@withContext
 
             val mainCategory = api.mainCategories.getOrNull(from.category)
             val tag = api.tags.getOrNull(from.tag)
@@ -169,7 +205,7 @@ class MainPageViewModel2(
                     MainPageEffect.ErrorLoading(error = error)
                 }
             }.onSuccess { response ->
-                val newList = fromList.addingAll(response.list)
+                val (newList, endReached) = mergeMainPageItems(fromList, response.list)
                 updateState {
                     // Outdated query, drop it
                     if (this.filter.query != from) {
@@ -181,16 +217,31 @@ class MainPageViewModel2(
                             error = null,
                             items = newList,
                             query = from.copy(page = nextPage),
-                            url = response.url
+                            url = response.url.ifBlank { filter.url },
+                            endReached = endReached,
                         )
                     )
                 }
             }
         } finally {
-            updateState {
-                copy(filter = filter.copy(loading = false))
+            // A coroutine cancelled while waiting for the mutex never acquired it.
+            // Do not unlock another request's mutex or clear that request's loading UI.
+            if (lockAcquired) {
+                try {
+                    withContext(NonCancellable) {
+                        updateState {
+                            if (filter.query == from) {
+                                copy(filter = filter.copy(loading = false))
+                            } else {
+                                this
+                            }
+                        }
+                    }
+                } finally {
+                    // Always release the mutex, even if state cleanup fails.
+                    expandMutex.unlock()
+                }
             }
-            expandMutex.unlock()
         }
     }
 
@@ -236,9 +287,16 @@ class MainPageViewModel2(
             }
 
             is MainPageAction.Expand -> {
-                if (state.value.filter.loading) return
+                if (state.value.filter.loading || state.value.filter.endReached) return
                 viewModelScope.launch {
                     expand()
+                }
+            }
+
+            MainPageAction.Refresh -> {
+                if (state.value.filter.loading) return
+                viewModelScope.launch {
+                    refresh()
                 }
             }
 
@@ -278,7 +336,7 @@ class MainPageViewModel2(
                                 category = if (action.type == DialogType.Category) action.selected else filter.query.category,
                                 orderBy = if (action.type == DialogType.OrderBy) action.selected else filter.query.orderBy,
                                 page = 0,
-                            ), items = persistentListOf(), error = null, url = ""
+                            ), items = persistentListOf(), error = null, url = "", endReached = false
                         ), dialog = null
                     )
                 }

@@ -15,7 +15,15 @@ import com.lagradost.quicknovel.newStreamResponse
 import com.lagradost.quicknovel.setStatus
 import org.jsoup.nodes.Document
 
+internal fun extractWuxiaBoxSearchId(url: String): String? =
+    Regex("""searchid=(\d+)""").find(url)?.groupValues?.getOrNull(1)
+
 open class WuxiaBoxProvider : MainAPI() {
+    companion object {
+        const val MAX_CHAPTER_PAGES = 100
+        const val MAX_SEARCH_PAGES = 20
+    }
+
     override val name = "WuxiaBox"
     override val mainUrl = "https://www.wuxiabox.com"
     override val iconId = R.drawable.icon_wuxiabox
@@ -158,9 +166,10 @@ open class WuxiaBoxProvider : MainAPI() {
 
 
         val chapters = mutableListOf<ChapterData>()
+        val seenChapterUrls = HashSet<String>()
 
         var currentPage = 0
-        while (true) {
+        while (currentPage < MAX_CHAPTER_PAGES) {
             val chaptersPageUrl = "$mainUrl/e/extend/fy.php?page=$currentPage&wjm=$bookId&X-Requested-With=XMLHttpRequest&_=${System.currentTimeMillis()}"
 
             val doc = app.get(chaptersPageUrl).document
@@ -170,10 +179,15 @@ open class WuxiaBoxProvider : MainAPI() {
 
             val pageChapters = chapterElements.mapNotNull { li ->
                 val link = li.selectFirst("a") ?: return@mapNotNull null
-                val url = fixUrl(link.attr("href"))
-                val title = link.selectFirst("strong.chapter-title")?.text()?.trim().orEmpty()
-                newChapterData(name = title, url = url)
-            }
+                val rawHref = link.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                val chapterUrl = fixUrl(rawHref)
+                val chapterTitle = link.selectFirst("strong.chapter-title")?.text()?.trim().orEmpty()
+                    .ifBlank { link.text().trim() }
+                if (chapterTitle.isEmpty()) return@mapNotNull null
+                newChapterData(name = chapterTitle, url = chapterUrl)
+            }.filter { seenChapterUrls.add(it.url) }
+
+            if (pageChapters.isEmpty()) break
 
             chapters.addAll(pageChapters)
             currentPage++
@@ -202,10 +216,29 @@ open class WuxiaBoxProvider : MainAPI() {
         return contentElement.html()
     }
 
+    private fun parseSearchDocument(document: Document): List<SearchResponse> {
+        return document.select("li.novel-item").mapNotNull { element ->
+            val node = element.selectFirst("a[title]") ?: return@mapNotNull null
+            val rawHref = node.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val href = fixUrl(rawHref)
+            val title = node.attr("title").trim()
+                .ifBlank { element.selectFirst("h4.novel-title")?.text()?.trim().orEmpty() }
+                .takeIf { it.isNotEmpty() }
+                ?: return@mapNotNull null
+
+            val cover = element.selectFirst("img")?.let {
+                it.attr("data-src").ifBlank { it.attr("src") }
+            }
+
+            newSearchResponse(title, href) {
+                posterUrl = fixUrlNull(cover)
+            }
+        }
+    }
+
     override suspend fun search(query: String): List<SearchResponse> {
-        var currentPage = 0
-        val results = mutableListOf<SearchResponse>()
-        val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
+        val cleanQuery = query.trim()
+        if (cleanQuery.isEmpty()) return emptyList()
 
         val response = app.post(
             "$mainUrl/e/search/index.php",
@@ -213,36 +246,24 @@ open class WuxiaBoxProvider : MainAPI() {
                 "show" to "title",
                 "tempid" to "1",
                 "tbname" to "news",
-                "keyboard" to encodedQuery // your search keyword
+                "keyboard" to cleanQuery
             ),
             allowRedirects = true
         )
 
-        // The server redirects with url result/?searchid=XXXXX
-        val redirectValue = response.url
+        val searchId = extractWuxiaBoxSearchId(response.url)
+        if (searchId.isNullOrBlank()) {
+            return parseSearchDocument(response.document)
+        }
 
-        // Regex to pull out the digits after searchid=
-        val searchId = Regex("searchid=(\\d+)").find(redirectValue)?.groupValues?.get(1)
+        var currentPage = 0
+        val results = mutableListOf<SearchResponse>()
+        val seenUrls = HashSet<String>()
 
-        while (true) {
+        while (currentPage < MAX_SEARCH_PAGES) {
             val url = "$mainUrl/e/search/result/index.php?page=$currentPage&searchid=$searchId"
             val document = app.get(url, timeout = 60).document
-
-            val pageResults = document.select("li.novel-item").mapNotNull { element ->
-                val node = element.selectFirst("a[title]") ?: return@mapNotNull null
-                val href = fixUrl(node.attr("href"))
-                val title = node.attr("title")
-                    .ifBlank { element.selectFirst("h4.novel-title")?.text() }
-                    ?: return@mapNotNull null
-
-                val cover = element.selectFirst("img")?.let {
-                    it.attr("data-src").ifBlank { it.attr("src") }
-                }
-
-                newSearchResponse(title, href) {
-                    posterUrl = fixUrlNull(cover)
-                }
-            }
+            val pageResults = parseSearchDocument(document).filter { seenUrls.add(it.url) }
 
             if (pageResults.isEmpty()) break
 
@@ -251,7 +272,6 @@ open class WuxiaBoxProvider : MainAPI() {
         }
 
         return results
-
     }
 
 }

@@ -1,6 +1,5 @@
 package com.lagradost.quicknovel.providers
 
-import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.quicknovel.ChapterData
 import com.lagradost.quicknovel.ErrorLoadingException
@@ -10,6 +9,7 @@ import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.UserReview
+import com.lagradost.quicknovel.fixUrl
 import com.lagradost.quicknovel.fixUrlNull
 import com.lagradost.quicknovel.network.WebViewResolver
 import com.lagradost.quicknovel.newChapterData
@@ -22,6 +22,71 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.roundToInt
+
+internal const val DEFAULT_WTR_LAB_AES_KEY = "IJAFUUxjM25hyzL2AZrn0wl7cESED6Ru"
+
+internal fun decodeWtrLabBase64(input: String): ByteArray {
+    val clean = input.replace(Regex("""\s+"""), "")
+        .replace('-', '+')
+        .replace('_', '/')
+        .trimEnd('=')
+    if (clean.isEmpty()) return ByteArray(0)
+    val out = java.io.ByteArrayOutputStream((clean.length * 3) / 4 + 1)
+    var buffer = 0
+    var bitsLeft = 0
+    for (ch in clean) {
+        val value = when (ch) {
+            in 'A'..'Z' -> ch - 'A'
+            in 'a'..'z' -> ch - 'a' + 26
+            in '0'..'9' -> ch - '0' + 52
+            '+' -> 62
+            '/' -> 63
+            else -> throw IllegalArgumentException("Invalid Base64 character: $ch")
+        }
+        buffer = (buffer shl 6) or value
+        bitsLeft += 6
+        if (bitsLeft >= 8) {
+            bitsLeft -= 8
+            out.write((buffer ushr bitsLeft) and 0xFF)
+        }
+    }
+    return out.toByteArray()
+}
+
+internal fun extractWtrLabAesKeyFromSource(source: String): String? {
+    val match = Regex("""new\s+TextEncoder(?:\(\))?\.encode\(\s*["']([^"']{32,})["']\s*\)""")
+        .find(source)
+        ?: return null
+    val key = match.groupValues[1]
+    return if (key.toByteArray(Charsets.UTF_8).size >= 32) key.substring(0, 32) else null
+}
+
+internal fun extractWtrLabChapterNo(order: Long, url: String): Long {
+    if (order > 0L) return order
+    return Regex("""(?:chapter-|/)(\d+)(?:[/?#]|$)""")
+        .find(url)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toLongOrNull()
+        ?.takeIf { it > 0L }
+        ?: 1L
+}
+
+private val WTR_PLACEHOLDER_TOKEN_REGEX = Regex(
+    """%\{(?:"([^"]*)":\s*"?([A-Za-z0-9+/=_-]+)"?|([^|{}%\u0000-\u001F\u007F\u2028\u2029]+?)\s*\|\s*([A-Za-z0-9+/=_-]+))\}"""
+)
+
+internal fun resolveWtrLabPlaceholderTokens(text: String): String {
+    if (!text.contains("%{")) return text
+    return WTR_PLACEHOLDER_TOKEN_REGEX.replace(text) { match ->
+        val rawFallback = (match.groupValues[1].ifEmpty { match.groupValues[3] }).trim()
+        val rawB64 = (match.groupValues[2].ifEmpty { match.groupValues[4] }).trim()
+        val decoded = runCatching {
+            String(decodeWtrLabBase64(rawB64), Charsets.UTF_8)
+        }.getOrDefault("")
+        decoded.ifBlank { rawFallback }.ifBlank { match.value }
+    }
+}
 
 
 class WtrLabProvider : MainAPI() {
@@ -242,32 +307,61 @@ class WtrLabProvider : MainAPI() {
         } ?: emptyList()
     }
 
+    @Volatile
+    private var cachedAesKey: String = DEFAULT_WTR_LAB_AES_KEY
+
     override suspend fun loadHtml(url: String): String? {
         val urlWithService = if (url.contains("?")) "$url&service=web" else "$url?service=web"
         try {
             val doc = app.get(urlWithService).document
+            doc.select("script:not([src])").forEach { scriptEl ->
+                extractWtrLabAesKeyFromSource(scriptEl.html())?.let { cachedAesKey = it }
+            }
             val jsonNode = doc.selectFirst("#__NEXT_DATA__")
             val json = jsonNode?.data() ?: throw ErrorLoadingException("No se encontró JSON de capítulos")
             val chaptersJson = parseJson<LoadJsonResponse.Root>(json)
             val chapter = chaptersJson.props.pageProps.serie
+            val chapterNo = extractWtrLabChapterNo(chapter.chapter.order, url)
 
-        val root = app.post(
-            url = "$mainUrl/api/reader/get", data = mapOf(
-                "chapter_id" to chapter.chapter.id.toString(),
-                "chapter_no" to chapter.serieData.slug,
-                "force_retry" to "false",
-                "language" to "en",
-                "raw_id" to chapter.serieData.rawId.toString(),
-                "retry" to "false",
-                "translate" to "web",
-            )
-        ).parsed<LoadJsonResponse2.Root>()
+            val root = app.post(
+                url = "$mainUrl/api/reader/get", data = mapOf(
+                    "chapter_id" to chapter.chapter.id.toString(),
+                    "chapter_no" to chapterNo.toString(),
+                    "force_retry" to "false",
+                    "language" to "en",
+                    "raw_id" to chapter.serieData.rawId.toString(),
+                    "retry" to "false",
+                    "translate" to "web",
+                )
+            ).parsed<LoadJsonResponse2.Root>()
 
-            val paragraphs = decryptContent(root.data.data.body)
+            val encryptedBody = root.data.data.body
+            val paragraphs = runCatching {
+                decryptContent(encryptedBody, cachedAesKey)
+            }.getOrElse { firstError ->
+                var refreshedKey: String? = null
+                val scriptUrls = doc.select("script[src]")
+                    .mapNotNull { it.attr("src").trim().takeIf { src -> src.contains("_next/static") } }
+                    .take(6)
+                for (scriptUrl in scriptUrls) {
+                    val scriptBody = runCatching { app.get(fixUrl(scriptUrl)).text }.getOrNull() ?: continue
+                    val candidate = extractWtrLabAesKeyFromSource(scriptBody)
+                    if (candidate != null) {
+                        refreshedKey = candidate
+                        break
+                    }
+                }
+                if (refreshedKey != null) {
+                    cachedAesKey = refreshedKey
+                    decryptContent(encryptedBody, refreshedKey)
+                } else {
+                    throw firstError
+                }
+            }
             val text = StringBuilder()
             for (p in paragraphs) {
                 text.append("<p>")
-                text.append(p)
+                text.append(resolveWtrLabPlaceholderTokens(p))
                 text.append("</p>")
             }
             return text.toString()
@@ -289,7 +383,11 @@ class WtrLabProvider : MainAPI() {
         }
     }
 
-    fun decryptContent(encryptedText: String): List<String> {
+    @JvmOverloads
+    fun decryptContent(
+        encryptedText: String,
+        keyString: String = cachedAesKey,
+    ): List<String> {
         if (encryptedText.isEmpty()) return emptyList()
 
         var isArray = false
@@ -305,16 +403,16 @@ class WtrLabProvider : MainAPI() {
         val parts = rawText.split(":")
         if (parts.size != 3) throw IllegalArgumentException("Invalid format")
 
-        val ivBytes = Base64.decode(parts[0], Base64.DEFAULT)
-        val shortCipher = Base64.decode(parts[1], Base64.DEFAULT)
-        val longCipher = Base64.decode(parts[2], Base64.DEFAULT)
+        val ivBytes = decodeWtrLabBase64(parts[0])
+        val shortCipher = decodeWtrLabBase64(parts[1])
+        val longCipher = decodeWtrLabBase64(parts[2])
 
         val cipherBytes = ByteArray(longCipher.size + shortCipher.size)
         System.arraycopy(longCipher, 0, cipherBytes, 0, longCipher.size)
         System.arraycopy(shortCipher, 0, cipherBytes, longCipher.size, shortCipher.size)
 
-        val keyString = "IJAFUUxjM25hyzL2AZrn0wl7cESED6Ru"
-        val keyBytes = keyString.substring(0, 32).toByteArray(Charsets.UTF_8)
+        val effectiveKey = if (keyString.length >= 32) keyString else DEFAULT_WTR_LAB_AES_KEY
+        val keyBytes = effectiveKey.substring(0, 32).toByteArray(Charsets.UTF_8)
         val secretKey = SecretKeySpec(keyBytes, "AES")
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -706,9 +804,10 @@ class WtrLabProvider : MainAPI() {
 
         data class Chapter(
             val id: Long,
-            val slug: String?,
+            val slug: String? = null,
+            val order: Long = 0,
             @JsonProperty("raw_id")
-            val rawId: Long,
+            val rawId: Long = 0,
             /*@JsonProperty("serie_id")
             val serieId: Long,
             val status: Long,

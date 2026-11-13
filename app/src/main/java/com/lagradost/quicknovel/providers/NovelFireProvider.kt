@@ -18,8 +18,86 @@ import com.lagradost.quicknovel.newSearchResponse
 import com.lagradost.quicknovel.newStreamResponse
 import com.lagradost.quicknovel.setStatus
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
+
+internal data class ParsedNovelFireChapter(
+    val name: String,
+    val url: String,
+)
+
+internal fun extractNovelFirePostId(document: Document): String? {
+    document.selectFirst("a#novel-report")?.attr("report-post_id")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { return it }
+    val scriptText = document.select("script").joinToString("\n") { it.html() }
+    return Regex("""(?:report-post_id|post_id)\s*[:=]\s*["']?(\d+)["']?""")
+        .find(scriptText)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.takeIf { it.isNotEmpty() }
+}
+
+internal fun parseNovelFireArchiveChapters(
+    document: Document,
+    mainUrl: String = "https://novelfire.net",
+): List<ParsedNovelFireChapter> {
+    val root = mainUrl.trimEnd('/')
+    return document.select(".chapter-list li").mapNotNull { element ->
+        val link = element.selectFirst("a[href]") ?: return@mapNotNull null
+        val rawHref = link.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+        val fullUrl = when {
+            rawHref.startsWith("http://") || rawHref.startsWith("https://") -> rawHref
+            rawHref.startsWith("/") -> "$root$rawHref"
+            else -> "$root/$rawHref"
+        }
+        val title = link.attr("title").trim().takeIf { it.isNotEmpty() }
+            ?: link.text().trim().takeIf { it.isNotEmpty() }
+            ?: return@mapNotNull null
+        ParsedNovelFireChapter(title, fullUrl)
+    }
+}
+
+internal fun extractNovelFireRedirectUrl(document: Document): String? {
+    if (document.selectFirst("div#content") != null) return null
+    val scriptText = document.select("script").joinToString("\n") { it.html() }
+    return Regex("""window\.location\.href\s*=\s*["']([^"']+)["']""")
+        .find(scriptText)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.replace("\\/", "/")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+}
+
+internal fun parseNovelFireChapterHtml(
+    document: Document,
+    normalize: (String) -> String = { text ->
+        text.lowercase()
+            .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+            .replace(Regex("[^a-z0-9]"), "")
+    },
+): String? {
+    var title = document.selectFirst("span.chapter-title")?.text().orEmpty()
+    val contentElement = document.selectFirst("div#content") ?: return null
+    contentElement.selectFirst("p")?.let { p ->
+        if (title.isNotBlank() && normalize(p.text()) == normalize(title)) {
+            title = ""
+        }
+    }
+    contentElement.select("img[src*=disable-blocker.jpg]").forEach { it.remove() }
+    contentElement.select("*").forEach { element ->
+        val tag = element.tagName()
+        if (tag.length > 5 && tag.startsWith("nf", ignoreCase = true)) {
+            element.remove()
+        }
+    }
+    val bodyHtml = contentElement.html().replace("&nbsp;", " ").trim()
+    if (bodyHtml.isEmpty()) return null
+    return if (title.isEmpty()) bodyHtml else "<p>$title</p><br>$bodyHtml"
+}
 
 open class NovelFireProvider : MainAPI() {
     override val name = "NovelFire"
@@ -131,17 +209,21 @@ open class NovelFireProvider : MainAPI() {
         val infoDiv = document.select("div.novel-info")
 
         val title = infoDiv.selectFirst("h1.novel-title")?.text()
+            ?: document.selectFirst("h1.novel-title, h1")?.text()
             ?: throw ErrorLoadingException("Title not found")
-        val id = document.selectFirst("a#novel-report")?.attr("report-post_id")
-            ?: throw ErrorLoadingException("Id not found")
+        val id = extractNovelFirePostId(document)
         val chapters = getChapters(url, id)
 
         return newStreamResponse(title, fixUrl(url), chapters) {
-            this.author = infoDiv.selectFirst("div.author > a")?.text()
-            this.posterUrl = fixUrlNull(document.selectFirst("figure.cover img")?.attr("src"))
+            this.author = infoDiv.selectFirst("div.author > a, .author .property-item > span")?.text()
+            this.posterUrl = fixUrlNull(
+                document.selectFirst("figure.cover img, .cover img")?.let { img ->
+                    img.attr("data-src").ifBlank { img.attr("src") }
+                }
+            )
             this.synopsis =
                 document.selectFirst("meta[itemprop=description]")?.attr("content")
-                    ?: document.selectFirst("div.summary > div")?.html() ?: ""
+                    ?: document.selectFirst("div.summary > div, .summary .content")?.html() ?: ""
 
             this.tags = infoDiv.select("div.categories ul li").mapNotNull {
                 it.text().trim().takeIf { text -> text.isNotEmpty() }
@@ -169,72 +251,86 @@ open class NovelFireProvider : MainAPI() {
                     ?.toIntOrNull() ?: 0
             this.rating = document.selectFirst("div.rating strong.nub")?.text()
                 ?.toFloatOrNull()?.times(20)?.times(10)?.roundToInt()
-            related = getRelated(id)
+            related = id?.let { runCatching { getRelated(it) }.getOrDefault(emptyList()) } ?: emptyList()
             reviewData = id
         }
     }
 
-    open suspend fun getChapters(url: String, id: String): List<ChapterData> {
+    open suspend fun getChapters(url: String, id: String?): List<ChapterData> {
         val bookSlug = url.trimEnd('/').substringAfterLast("/")
-        val ajaxUrl = "$mainUrl/ajax/listChapterDataAjax"
-        val response = app.get(
-            ajaxUrl, params = mapOf(
-                "draw" to "1",
-                "columns[0][data]" to "n_sort",
-                "columns[0][name]" to "cmm_posts_detail.n_sort",
-                "columns[0][searchable]" to "true",
-                "columns[0][orderable]" to "true",
-                "columns[0][search][value]" to "",
-                "columns[0][search][regex]" to "false",
-                "columns[1][data]" to "bookmark_created_at",
-                "columns[1][name]" to "bookmark_chapters.created_at",
-                "columns[1][searchable]" to "false",
-                "columns[1][orderable]" to "true",
-                "columns[1][search][value]" to "",
-                "columns[1][search][regex]" to "false",
-                "order[0][column]" to "0",
-                "order[0][dir]" to "asc",
-                "order[0][name]" to "cmm_posts_detail.n_sort",
-                "start" to "0",
-                "length" to "-1",
-                "search[value]" to "",
-                "search[regex]" to "false",
-                "post_id" to id,
-                "only_bookmark" to "false",
-                // Avoid serving a cached, stale DataTables response.
-                "_" to System.currentTimeMillis().toString()
-            )
-        ).parsed<AjaxChapterRoot>()
+        if (!id.isNullOrBlank()) {
+            val ajaxChapters = runCatching {
+                val ajaxUrl = "$mainUrl/ajax/listChapterDataAjax"
+                val response = app.get(
+                    ajaxUrl, params = mapOf(
+                        "draw" to "1",
+                        "columns[0][data]" to "n_sort",
+                        "columns[0][name]" to "cmm_posts_detail.n_sort",
+                        "columns[0][searchable]" to "true",
+                        "columns[0][orderable]" to "true",
+                        "columns[0][search][value]" to "",
+                        "columns[0][search][regex]" to "false",
+                        "columns[1][data]" to "bookmark_created_at",
+                        "columns[1][name]" to "bookmark_chapters.created_at",
+                        "columns[1][searchable]" to "false",
+                        "columns[1][orderable]" to "true",
+                        "columns[1][search][value]" to "",
+                        "columns[1][search][regex]" to "false",
+                        "order[0][column]" to "0",
+                        "order[0][dir]" to "asc",
+                        "order[0][name]" to "cmm_posts_detail.n_sort",
+                        "start" to "0",
+                        "length" to "-1",
+                        "search[value]" to "",
+                        "search[regex]" to "false",
+                        "post_id" to id,
+                        "only_bookmark" to "false",
+                        // Avoid serving a cached, stale DataTables response.
+                        "_" to System.currentTimeMillis().toString()
+                    )
+                ).parsed<AjaxChapterRoot>()
 
-        val ajaxChapters = response.data?.mapNotNull { item ->
-            val rawSort = item.nSort?.trim() ?: return@mapNotNull null
-            val chapterNumber = rawSort.toDoubleOrNull() ?: return@mapNotNull null
-            val chapterSlug = if (chapterNumber % 1.0 == 0.0) {
-                chapterNumber.toLong().toString()
-            } else {
-                rawSort
-            }
-            val rawTitle = item.title?.takeIf { it.isNotBlank() } ?: "Chapter $chapterSlug"
-            val chapterUrl = "$mainUrl/$sectionUrl/$bookSlug/chapter-$chapterSlug"
-            newChapterData(rawTitle, chapterUrl) {
-                this.dateOfRelease = item.createdAt
-            }
-        } ?: emptyList()
+                response.data?.mapNotNull { item ->
+                    val rawSort = item.nSort?.trim() ?: return@mapNotNull null
+                    val chapterNumber = rawSort.toDoubleOrNull() ?: return@mapNotNull null
+                    val chapterSlug = if (chapterNumber % 1.0 == 0.0) {
+                        chapterNumber.toLong().toString()
+                    } else {
+                        rawSort
+                    }
+                    val rawTitle = item.title?.takeIf { it.isNotBlank() } ?: "Chapter $chapterSlug"
+                    val chapterUrl = "$mainUrl/$sectionUrl/$bookSlug/chapter-$chapterSlug"
+                    newChapterData(rawTitle, chapterUrl) {
+                        this.dateOfRelease = item.createdAt
+                    }
+                } ?: emptyList()
+            }.getOrDefault(emptyList())
 
-        if (ajaxChapters.isNotEmpty()) return ajaxChapters
-
-        // The site sometimes returns an empty DataTables payload. Fall back to
-        // the novel's HTML chapter archive so novels don't appear to have 0 chapters.
-        val archiveUrl = "$mainUrl/$sectionUrl/$bookSlug/chapters?page=1"
-        val archiveDocument = app.get(archiveUrl).document
-        return archiveDocument.select(".chapter-list li").mapNotNull { element ->
-            val link = element.selectFirst("a[href]") ?: return@mapNotNull null
-            val href = link.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val title = link.attr("title").takeIf { it.isNotBlank() }
-                ?: link.text().trim().takeIf { it.isNotBlank() }
-                ?: return@mapNotNull null
-            newChapterData(title, href)
+            if (ajaxChapters.isNotEmpty()) return ajaxChapters
         }
+
+        // Fall back to the novel's paginated HTML chapter archive so novels never show 0 chapters
+        // even when #novel-report or DataTables AJAX is unavailable.
+        val allChapters = mutableListOf<ChapterData>()
+        val seenUrls = HashSet<String>()
+        var page = 1
+        var maxPage = 1
+        while (page <= maxPage && page <= 50) {
+            val archiveUrl = "$mainUrl/$sectionUrl/$bookSlug/chapters?page=$page"
+            val archiveDocument = app.get(archiveUrl).document
+            if (page == 1) {
+                val discoveredMax = archiveDocument.select("ul.pagination a[href*=page=], .pagination a[href*=page=]")
+                    .mapNotNull { Regex("""page=(\d+)""").find(it.attr("href"))?.groupValues?.getOrNull(1)?.toIntOrNull() }
+                    .maxOrNull() ?: 1
+                maxPage = discoveredMax.coerceIn(1, 50)
+            }
+            val parsed = parseNovelFireArchiveChapters(archiveDocument, mainUrl)
+            val newItems = parsed.filter { seenUrls.add(it.url) }.map { newChapterData(it.name, it.url) }
+            if (newItems.isEmpty()) break
+            allChapters.addAll(newItems)
+            page++
+        }
+        return allChapters
     }
 
     suspend fun getRelated(id: String): List<SearchResponse> {
@@ -302,31 +398,29 @@ open class NovelFireProvider : MainAPI() {
     }
 
     override suspend fun loadHtml(url: String): String? {
-        val document = app.get(url).document
-        var title = document.selectFirst("span.chapter-title")?.text() ?: ""
-        val contentElement = document.selectFirst("div#content")?.apply {
-            selectFirst("p")?.let { p ->
-                if (normalize(p.text()) == normalize(title)) title = ""
-            }
-            select("img[src*=disable-blocker.jpg]").forEach { it.remove() }
-        } ?: return null
-
-        return if (title.isEmpty())
-            contentElement.html()
-        else
-            "<p>$title</p><br>${contentElement.html()}"
+        var document = app.get(url).document
+        extractNovelFireRedirectUrl(document)?.let { redirectUrl ->
+            document = app.get(fixUrl(redirectUrl)).document
+        }
+        return parseNovelFireChapterHtml(document, ::normalize)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search/?keyword=${Uri.encode(query.trim()).replace("%20", "+")}&page=1"
         val document = app.get(url).document
 
-        return document.select("ul.novel-list.horizontal.col2.chapters li.novel-item")
+        return document.select("ul.novel-list.chapters li.novel-item, ul.novel-list li.novel-item, li.novel-item")
             .mapNotNull { element ->
                 val a = element.selectFirst("a") ?: return@mapNotNull null
                 val title = a.attr("title").trim()
-                val novelUrl = a.attr("href")
-                val coverUrl = fixUrlNull(a.selectFirst("img")?.attr("src"))
+                    .ifBlank { element.selectFirst("h4.novel-title, h4, .novel-title")?.text()?.trim().orEmpty() }
+                if (title.isBlank()) return@mapNotNull null
+                val novelUrl = a.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                val coverUrl = fixUrlNull(
+                    element.selectFirst("img")?.let { img ->
+                        img.attr("data-src").ifBlank { img.attr("src") }
+                    }
+                )
                 newSearchResponse(title, novelUrl) {
                     posterUrl = coverUrl
                 }

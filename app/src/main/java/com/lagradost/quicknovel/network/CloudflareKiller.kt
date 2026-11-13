@@ -15,6 +15,35 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import java.util.concurrent.ConcurrentHashMap
 
+internal fun isCloudflareChallengeResponse(
+    statusCode: Int,
+    cfRay: String?,
+    server: String?,
+    cfMitigated: String?,
+    location: String?,
+    bodySample: String,
+): Boolean {
+    if (cfMitigated?.equals("challenge", ignoreCase = true) == true) return true
+    val hasCloudflareHeaders =
+        !cfRay.isNullOrBlank() ||
+            server?.contains("cloudflare", ignoreCase = true) == true
+
+    val lowerBody = bodySample.lowercase()
+    val isChallengeBody = lowerBody.contains("cf-browser-verification") ||
+        lowerBody.contains("checking your browser") ||
+        lowerBody.contains("just a moment") ||
+        lowerBody.contains("/cdn-cgi/") ||
+        lowerBody.contains("one moment...") ||
+        lowerBody.contains("un momento…") ||
+        lowerBody.contains("cf-turnstile")
+
+    if (statusCode in setOf(403, 429, 503, 520) && (hasCloudflareHeaders || isChallengeBody)) {
+        return true
+    }
+
+    return location.orEmpty().lowercase().contains("/cdn-cgi/") || isChallengeBody
+}
+
 /**
  * Interceptor designed to bypass Cloudflare and Turnstile protections.
  * It detects challenges and uses a hidden WebView to solve them and capture the resulting session.
@@ -85,30 +114,18 @@ class CloudflareKiller : Interceptor {
     }
 
     private fun looksLikeCloudflareChallenge(response: Response): Boolean {
-        val hasCloudflareHeaders =
-            response.header("cf-ray") != null ||
-                    response.header("server")?.contains("cloudflare", ignoreCase = true) == true
-
-        // Read a small sample of the body to check for challenge scripts.
         val bodySample = runCatching {
-            response.peekBody(1024 * 10).string().lowercase()
+            response.peekBody(1024 * 10).string()
         }.getOrDefault("")
 
-        val isChallengeBody = bodySample.contains("cf-browser-verification") ||
-                bodySample.contains("checking your browser") ||
-                bodySample.contains("just a moment") ||
-                bodySample.contains("/cdn-cgi/") ||
-                bodySample.contains("one moment...") ||
-                bodySample.contains("un momento…")
-
-        if (response.code in listOf(403, 429, 503)) {
-            if (hasCloudflareHeaders || isChallengeBody) return true
-        }
-
-        return response.header("location")
-            .orEmpty()
-            .lowercase()
-            .contains("/cdn-cgi/") || isChallengeBody
+        return isCloudflareChallengeResponse(
+            statusCode = response.code,
+            cfRay = response.header("cf-ray"),
+            server = response.header("server"),
+            cfMitigated = response.header("cf-mitigated"),
+            location = response.header("location"),
+            bodySample = bodySample,
+        )
     }
 
     /**

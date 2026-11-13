@@ -113,14 +113,15 @@
 
                     tools:listitem="@layout/single_text"
                     android:layout_width="match_parent"
-                    android:layout_height="match_parent">
+                    android:layout_height="0dp"
+                    android:layout_weight="1">
 
             </androidx.recyclerview.widget.RecyclerView>
 
             <View
                     android:id="@+id/read_bottom_item"
                     android:layout_width="match_parent"
-                    android:layout_height="0dp" />
+                    android:layout_height="25dp" />
 
             <ScrollView
                     android:visibility="gone"
@@ -231,29 +232,30 @@
                 android:layout_height="40dp"
                 android:background="@color/colorPrimary" />
 
-        <FrameLayout
-
+        <LinearLayout
                 android:visibility="visible"
                 android:id="@+id/read_overlay"
                 android:orientation="horizontal"
+                android:gravity="center_vertical"
                 android:layout_gravity="bottom"
                 android:layout_width="match_parent"
-                android:paddingLeft="10dp"
-                android:paddingRight="10dp"
-                android:background="@color/transparent"
-
-                android:layout_height="25dp">
+                android:layout_height="wrap_content"
+                android:minHeight="25dp"
+                android:paddingLeft="20dp"
+                android:paddingRight="20dp"
+                android:background="@color/transparent">
 
             <TextClock
                     tools:text="20:35"
                     android:textStyle="bold"
-                    android:layout_marginStart="20dp"
+                    android:layout_marginEnd="12dp"
                     android:gravity="center_vertical"
                     android:id="@+id/read_time_clock"
                     android:textSize="11sp"
                     android:textColor="@color/readerTextColor"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minHeight="25dp"
                     tools:ignore="SmallSp"
                     android:format12Hour="hh:mm a"
                     android:format24Hour="HH:mm" />
@@ -262,73 +264,53 @@
                     android:visibility="gone"
                     tools:text="20:35"
                     android:textStyle="bold"
-                    android:layout_marginStart="20dp"
                     android:gravity="center_vertical"
                     android:id="@+id/read_time"
                     android:textSize="11sp"
                     android:textColor="@color/readerTextColor"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent"
+                    android:layout_width="0dp"
+                    android:layout_height="0dp"
                     tools:ignore="SmallSp" />
 
+            <ProgressBar
+                    android:id="@+id/read_overflow_progress"
+                    style="@style/Widget.AppCompat.ProgressBar.Horizontal"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="4dp"
+                    android:layout_gravity="center_vertical"
+                    android:visibility="gone"
+                    android:indeterminate="false"
+                    android:max="1000"
+                    android:progress="0" />
+
             <TextView
-                    tools:text="20:35"
+                    tools:text="85%"
                     android:textStyle="bold"
                     android:gravity="center_vertical|end"
                     android:id="@+id/read_battery"
                     android:textSize="11sp"
-                    android:layout_marginEnd="20dp"
+                    android:layout_marginStart="12dp"
                     android:textColor="@color/readerTextColor"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minHeight="25dp"
                     tools:ignore="SmallSp" />
 
             <TextView
                     android:visibility="gone"
-                    android:layout_marginLeft="50dp"
-                    android:layout_marginRight="50dp"
                     android:textSize="10sp"
                     android:id="@+id/read_chapter_name"
-                    android:layout_width="match_parent"
+                    android:layout_width="0dp"
+                    android:layout_height="0dp"
                     android:ellipsize="middle"
                     android:gravity="center"
-                    android:layout_gravity="center_horizontal"
-                    android:layout_height="match_parent"
                     tools:text="Chapter 1148 - You Will Support Me in the Future"
                     android:textColor="@color/readerTextColor"
                     tools:ignore="SmallSp" />
-            <!--        <ImageView
-                            android:id="@+id/read_menu"
-                            android:background="?selectableItemBackgroundBorderless"
-                            android:src="@drawable/ic_baseline_menu_24"
-                            android:layout_width="15dp" android:layout_height="15dp"
-                            android:layout_gravity="end|center_vertical"
-                            android:layout_margin="5dp"
-                            android:contentDescription="@string/select_chapter">
-                    </ImageView>-->
+        </LinearLayout>
 
-            <!--<TextView
-                    android:text="78.5%"
-                    android:textStyle="bold"
-                    android:gravity="center"
-                    android:layout_gravity="end"
-                    android:textSize="11sp"
-                    android:textColor="@color/readerTextColor"
-                    android:layout_width="50dp" android:layout_height="match_parent">
-            </TextView>-->
-        </FrameLayout>
 
-        <androidx.core.widget.ContentLoadingProgressBar
-
-                android:id="@+id/read_overflow_progress"
-                android:layout_gravity="bottom"
-                android:layout_width="match_parent"
-                android:visibility="gone"
-                style="@style/Widget.AppCompat.ProgressBar.Horizontal"
-                android:layout_marginBottom="-5dp"
-                android:layout_height="10dp">
-
-        </androidx.core.widget.ContentLoadingProgressBar>
 
 
         <LinearLayout
@@ -504,4 +486,5 @@
                     android:layout_height="match_parent" />
         </com.google.android.material.appbar.AppBarLayout>
     </FrameLayout>
+
 </FrameLayout>

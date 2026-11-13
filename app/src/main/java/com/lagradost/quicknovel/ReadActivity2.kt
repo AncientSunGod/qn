@@ -6,6 +6,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.content.res.Resources
@@ -21,14 +23,17 @@ import android.view.WindowManager
 import android.widget.AbsListView
 import android.widget.ArrayAdapter
 import android.widget.FrameLayout
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import androidx.activity.viewModels
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.animation.doOnEnd
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -72,6 +77,7 @@ import com.lagradost.quicknovel.util.UIHelper.popupMenu
 import com.lagradost.quicknovel.util.UIHelper.systemFonts
 import com.lagradost.quicknovel.util.divCeil
 import com.lagradost.quicknovel.util.toPx
+import java.io.File
 import java.lang.Integer.max
 import java.lang.ref.WeakReference
 import java.util.Locale
@@ -163,6 +169,40 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
     lateinit var binding: ReadMainBinding
     private val viewModel: ReadActivityViewModel by viewModels()
+
+    private val importFontLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri == null) return@registerForActivityResult
+        try {
+            val displayName = contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            } ?: "custom-font.ttf"
+            val safeName = displayName.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._ -]"), "_")
+            val extension = safeName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+            if (extension !in setOf("ttf", "otf", "ttc", "otc")) {
+                showToast("Choose a .ttf, .otf, .ttc or .otc font file")
+                return@registerForActivityResult
+            }
+            val directory = File(filesDir, "reader-fonts").apply { mkdirs() }
+            val destination = File(directory, safeName)
+            contentResolver.openInputStream(uri)?.use { input ->
+                destination.outputStream().use { output -> input.copyTo(output) }
+            } ?: throw IllegalStateException("Unable to open selected font")
+            // Validate the font before making it the active reader typeface.
+            android.graphics.Typeface.createFromFile(destination)
+            viewModel.textFont = destination.name
+            updateTextAdapterConfig()
+            showToast("Font imported: " + destination.name)
+        } catch (error: Exception) {
+            showToast("Could not import font: " + (error.message ?: "unknown error"))
+        }
+    }
+
 
     private var _imageHolder: WeakReference<LinearLayout>? = null
     var imageHolder
@@ -328,14 +368,44 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         return topY + binding.realText.paddingTop
     }
 
+    private var lastOverlayBottomInset: Int = 0
+    private var isProgressVisibleInOverlay: Boolean = false
+
+    private fun syncBottomReaderInset() {
+        val reservedHeight = if (binding.readOverlay.isVisible) {
+            maxOf(binding.readOverlay.height, 25.toPx + lastOverlayBottomInset)
+        } else {
+            lastOverlayBottomInset
+        }
+        val params = binding.readBottomItem.layoutParams
+        if (params != null && params.height != reservedHeight) {
+            params.height = reservedHeight
+            binding.readBottomItem.layoutParams = params
+        }
+    }
+
+    private fun updateBottomOverlayVisibility() {
+        val canShowInReader = binding.readNormalLayout.isVisible
+        val showTimeOrBattery = viewModel.showTime || viewModel.showBattery
+        val showProgress = canShowInReader && isProgressVisibleInOverlay
+        binding.readOverflowProgress.isVisible = showProgress
+        binding.readOverlay.isVisible = canShowInReader && (showTimeOrBattery || showProgress)
+        syncBottomReaderInset()
+    }
+
     private fun getBottomY(): Int {
         val outLocation = IntArray(2)
         binding.readBottomItem.getLocationInWindow(outLocation)
         val (_, bottomY) = outLocation
-        return bottomY - max(
-            binding.realText.paddingBottom,
-            if (viewModel.showTime || viewModel.showBattery) binding.readOverlay.height else 0
-        )
+        // readBottomItem already sits immediately above readOverlay; only fall back to
+        // subtracting readOverlay height if readBottomItem has not laid out yet.
+        val unreservedOverlayHeight =
+            if (binding.readOverlay.isVisible && binding.readBottomItem.height == 0) {
+                binding.readOverlay.height
+            } else {
+                0
+            }
+        return bottomY - max(binding.realText.paddingBottom, unreservedOverlayHeight)
     }
 
     /**
@@ -358,15 +428,23 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
     private fun getAllLines(): ArrayList<TextVisualLine> {
         val lines: ArrayList<TextVisualLine> = arrayListOf()
+        val firstVisible = textLayoutManager.findFirstVisibleItemPosition()
+        val lastVisible = textLayoutManager.findLastVisibleItemPosition()
+        if (firstVisible == RecyclerView.NO_POSITION ||
+            lastVisible == RecyclerView.NO_POSITION ||
+            lastVisible < firstVisible
+        ) return lines
 
-        for (i in textLayoutManager.findFirstVisibleItemPosition()..textLayoutManager.findLastVisibleItemPosition()) {
+        for (i in firstVisible..lastVisible) {
             lines.addAll(textAdapter.getLines(transformIndexToScrollVisibilityItem(i)))
         }
         return lines
     }
 
     private fun postLines(lines: ArrayList<TextVisualLine>) {
-        if (lines.isEmpty()) {
+        // RecyclerView can dispatch its initial layout callbacks before the async book
+        // loader has constructed the book and renderer. Ignore those callbacks safely.
+        if (!viewModel.isReaderReady() || lines.isEmpty()) {
             return
         }
 
@@ -390,8 +468,82 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         )
     }
 
+    private fun chapterRenderedLength(chapterIndex: Int): Int {
+        // TextSpan.start/end are offsets in the complete rendered chapter, not offsets
+        // within an adapter row. The maximum end therefore gives a stable chapter length.
+        return textAdapter.immutableCurrentList
+            .asSequence()
+            .filterIsInstance<TextSpan>()
+            .filter { it.index == chapterIndex }
+            .maxOfOrNull { it.end }
+            ?: 0
+    }
+
+    private fun updateChapterReadingProgress() {
+        if (!::textAdapter.isInitialized || !::textLayoutManager.isInitialized) return
+        if (!viewModel.isReaderReady()) {
+            isProgressVisibleInOverlay = false
+            updateBottomOverlayVisibility()
+            return
+        }
+
+        val chapterCount = viewModel.book.size()
+        if (chapterCount <= 0) return
+        val viewportTop = getTopY()
+        val lines = getAllLines()
+        // Use the first text line crossing the reading viewport. Adapter positions are
+        // unstable because the reader keeps a moving window of chapters and paragraph
+        // rows have very different heights. Character offsets remain tied to the chapter.
+        val visibleLine = lines.firstOrNull { it.bottom > viewportTop }
+            ?: return
+        // During a chapter transition the viewport can temporarily contain only a
+        // separator/loading row. Those rows have no TextVisualLine. Do not substitute
+        // currentIndex + character 0 here: that makes the whole-book bar teleport back
+        // to the start of a chapter while RecyclerView is swapping its visible rows.
+        val chapterIndex = visibleLine.index.coerceIn(0, chapterCount - 1)
+        val chapterLength = chapterRenderedLength(chapterIndex)
+
+        val lineHeight = (visibleLine.bottom - visibleLine.top).coerceAtLeast(1)
+        val fractionThroughLine = (
+            (viewportTop - visibleLine.top).toFloat() / lineHeight.toFloat()
+        ).coerceIn(0f, 1f)
+        val chapterPosition = visibleLine.startChar + (
+            (visibleLine.endChar - visibleLine.startChar).coerceAtLeast(0) *
+                fractionThroughLine
+            ).roundToInt()
+
+        val canScrollDown = binding.realText.canScrollVertically(1)
+        val bottomLine = lines.lastOrNull()
+        val bottomChapterIndex = bottomLine?.index?.coerceIn(0, chapterCount - 1)
+        val bottomChapterLength = bottomChapterIndex?.let(::chapterRenderedLength) ?: 0
+        val hasLaterRenderedChapter = bottomChapterIndex != null &&
+            textAdapter.immutableCurrentList
+                .asSequence()
+                .filterIsInstance<TextSpan>()
+                .any { it.index > bottomChapterIndex }
+
+        binding.readOverflowProgress.progress = resolveEffectiveReaderProgress(
+            topChapterIndex = chapterIndex,
+            topCharacterPosition = chapterPosition,
+            topChapterLength = chapterLength,
+            bottomChapterIndex = bottomChapterIndex,
+            bottomChapterLength = bottomChapterLength,
+            chapterCount = chapterCount,
+            canScrollDown = canScrollDown,
+            hasLaterRenderedChapter = hasLaterRenderedChapter,
+        )
+        isProgressVisibleInOverlay = true
+        updateBottomOverlayVisibility()
+    }
+
     fun onScroll() {
+        if (!viewModel.isReaderReady()) {
+            isProgressVisibleInOverlay = false
+            updateBottomOverlayVisibility()
+            return
+        }
         postLines(getAllLines())
+        updateChapterReadingProgress()
     }
 
     private var cachedChapter: List<SpanDisplay> = emptyList()
@@ -537,6 +689,17 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         config.setArgs(binding.readBattery, CONFIG_FONT or CONFIG_COLOR or CONFIG_FONT_BOLD)
         config.setArgs(binding.readTimeClock, CONFIG_FONT or CONFIG_COLOR or CONFIG_FONT_BOLD)
         config.setArgs(binding.readLoadingBar)
+        val primary = ContextCompat.getColor(this, R.color.colorPrimary)
+        val indicatorColor = if (
+            androidx.core.graphics.ColorUtils.calculateContrast(primary, config.backgroundColor) >= 2.5
+        ) {
+            primary
+        } else {
+            androidx.core.graphics.ColorUtils.setAlphaComponent(config.textColor, 220)
+        }
+        val trackColor = androidx.core.graphics.ColorUtils.setAlphaComponent(config.textColor, 60)
+        binding.readOverflowProgress.progressTintList = ColorStateList.valueOf(indicatorColor)
+        binding.readOverflowProgress.progressBackgroundTintList = ColorStateList.valueOf(trackColor)
     }
 
     private fun updatePadding() {
@@ -601,6 +764,82 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             }
         }
     }*/
+
+    private fun showTextReplacements() {
+        fun editRule(existingIndex: Int? = null) {
+            val current = viewModel.getTextReplacements()
+            val existing = existingIndex?.let(current::getOrNull)
+            val findInput = EditText(this).apply {
+                hint = "Word or phrase to find"
+                setSingleLine(false)
+                minLines = 1
+                setText(existing?.find.orEmpty())
+            }
+            val replaceInput = EditText(this).apply {
+                hint = "Replace it with"
+                setSingleLine(false)
+                minLines = 1
+                setText(existing?.replace.orEmpty())
+            }
+            val container = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                val side = 20.toPx
+                setPadding(side, 4.toPx, side, 0)
+                addView(findInput, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ))
+                addView(replaceInput, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ))
+            }
+            val dialog = AlertDialog.Builder(this, R.style.AlertDialogCustom)
+                .setTitle(if (existing == null) "Add text replacement" else "Edit text replacement")
+                .setView(container)
+                .setPositiveButton(if (existing == null) "Add" else "Save", null)
+                .setNegativeButton("Cancel", null)
+                .apply {
+                    if (existing != null) setNeutralButton("Delete", null)
+                }
+                .create()
+            dialog.setOnShowListener {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    val find = findInput.text?.toString().orEmpty()
+                    val replacement = replaceInput.text?.toString().orEmpty()
+                    if (find.isBlank()) {
+                        findInput.error = "Enter a word or phrase"
+                        return@setOnClickListener
+                    }
+                    val updated = current.toMutableList()
+                    if (existingIndex == null) {
+                        updated.add(TextReplacementRule(find, replacement))
+                    } else {
+                        updated[existingIndex] = TextReplacementRule(find, replacement)
+                    }
+                    viewModel.saveTextReplacements(updated)
+                    dialog.dismiss()
+                }
+                if (existing != null) {
+                    dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                        viewModel.saveTextReplacements(current.filterIndexed { index, _ -> index != existingIndex })
+                        dialog.dismiss()
+                    }
+                }
+            }
+            dialog.show()
+        }
+
+        val rules = viewModel.getTextReplacements()
+        val labels = rules.map { it.find + "  →  " + it.replace }.toTypedArray()
+        AlertDialog.Builder(this, R.style.AlertDialogCustom)
+            .setTitle("Custom text replacements")
+            .setItems(labels) { _, which -> editRule(which) }
+            .setPositiveButton("Add new") { _, _ -> editRule() }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
     private fun showFonts() {
         val builder =
             AlertDialog.Builder(this, R.style.AlertDialogCustom).setView(R.layout.font_bottom_sheet)
@@ -610,7 +849,10 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
         val res = dialog.findViewById<RecyclerView>(R.id.sort_click)!!
 
-        val fonts = systemFonts
+        val customFonts = File(filesDir, "reader-fonts").listFiles()
+            ?.filter { it.isFile && it.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc", "otc") }
+            .orEmpty()
+        val fonts = systemFonts.toList() + customFonts
         val items = listOf(FontFile(null)) + fonts.map { FontFile(it) }
 
         val currentName = getKey(EPUB_FONT) ?: ""
@@ -683,6 +925,9 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
     override fun onDestroy() {
         viewModel.stopTTS()
+        if (isFinishing) {
+            QuickStreamSessionStore.release(intent?.getStringExtra(QUICK_STREAM_SESSION_EXTRA))
+        }
         this.unregisterReceiver(mBatInfoReceiver)
         super.onDestroy()
     }
@@ -700,12 +945,51 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         readActivity = this
         binding = ReadMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        val baseOverlayHorizontalPadding = 20.toPx
+        ViewCompat.setOnApplyWindowInsetsListener(binding.readerContainer) { _, insets ->
+            val topCutout = insets.getInsetsIgnoringVisibility(
+                WindowInsetsCompat.Type.displayCutout()
+            ).top
+            binding.readTopItem.layoutParams?.let { topParams ->
+                if (topParams.height != topCutout) {
+                    topParams.height = topCutout
+                    binding.readTopItem.layoutParams = topParams
+                }
+            }
+
+            val bottomAndSideInsets = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            lastOverlayBottomInset = bottomAndSideInsets.bottom
+            binding.readOverlay.setPadding(
+                maxOf(baseOverlayHorizontalPadding, bottomAndSideInsets.left),
+                0,
+                maxOf(baseOverlayHorizontalPadding, bottomAndSideInsets.right),
+                lastOverlayBottomInset,
+            )
+            syncBottomReaderInset()
+            insets
+        }
+        binding.readOverlay.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            syncBottomReaderInset()
+        }
+        ViewCompat.requestApplyInsets(binding.root)
+
+        binding.readOverflowProgress.apply {
+            isIndeterminate = false
+            isVisible = false
+            max = 1000
+            progress = 0
+        }
         fixSystemBarsPadding(binding.readerBottomViewHolder, padTop = false, overlayCutout = false)
         fixSystemBarsPadding(binding.readToolbarHolder, padBottom = false, overlayCutout = false)
 
         registerBattery()
 
-        viewModel.init(intent, this)
+        // Reader loading is started after all views, adapters, layout managers and
+        // observers have been installed. Previously a very fast cached chapter could
+        // finish while onCreate was still assembling the RecyclerView.
         topBarHeight = binding.readToolbarHolder.minimumHeight + getStatusBarHeight()
         binding.readToolbarHolder.minimumHeight = topBarHeight
         textAdapter = TextAdapter(
@@ -716,6 +1000,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 textColor = viewModel.textColor,
                 textSize = viewModel.textSize,
                 textFont = viewModel.textFont,
+                customFontsDirectory = File(filesDir, "reader-fonts"),
                 backgroundColor = viewModel.backgroundColor,
                 bionicReading = viewModel.bionicReading,
                 isTextSelectable = viewModel.isTextSelectable,
@@ -726,6 +1011,22 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         ).apply {
             setHasStableIds(true)
         }
+
+        // List diffs can finish after the loading observer's first visibility update.
+        // Recalculate once the RecyclerView has applied the new chapter rows.
+        textAdapter.registerAdapterDataObserver(object : RecyclerView.AdapterDataObserver() {
+            private fun refreshProgressAfterLayout() {
+                binding.realText.post { updateChapterReadingProgress() }
+            }
+
+            override fun onChanged() = refreshProgressAfterLayout()
+            override fun onItemRangeChanged(positionStart: Int, itemCount: Int) =
+                refreshProgressAfterLayout()
+            override fun onItemRangeInserted(positionStart: Int, itemCount: Int) =
+                refreshProgressAfterLayout()
+            override fun onItemRangeRemoved(positionStart: Int, itemCount: Int) =
+                refreshProgressAfterLayout()
+        })
 
         binding.readToolbar.apply {
             setNavigationIcon(R.drawable.ic_baseline_arrow_back_24)
@@ -778,12 +1079,12 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
         observe(viewModel.showBatteryLive) { show ->
             binding.readBattery.isVisible = show
-            binding.readOverlay.isVisible = show && viewModel.showTime
+            updateBottomOverlayVisibility()
         }
 
         observe(viewModel.showTimeLive) { show ->
             binding.readTimeClock.isVisible = show
-            binding.readOverlay.isVisible = show && viewModel.showBattery
+            updateBottomOverlayVisibility()
         }
 
         observe(viewModel.screenAwakeLive) { awake ->
@@ -966,6 +1267,15 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                     binding.readFail.isVisible = false
 
                     binding.readNormalLayout.isVisible = true
+                    // Show the progress indicator immediately on a successful chapter load;
+                    // the first progress calculation may return early while the adapter
+                    // or layout manager is still initializing.
+                    isProgressVisibleInOverlay = true
+                    updateBottomOverlayVisibility()
+                    // The reader can become visible without another RecyclerView scroll
+                    // event (initial chapter load, restore, or retry). Initialize the
+                    // position indicator after layout has measured the first visible item.
+                    binding.realText.post { updateChapterReadingProgress() }
 
                     if (different) {
                         binding.readNormalLayout.alpha = 0.01f
@@ -980,7 +1290,9 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 }
 
                 is Resource.Loading -> {
+                    isProgressVisibleInOverlay = false
                     binding.readNormalLayout.isVisible = false
+                    updateBottomOverlayVisibility()
                     binding.readFail.isVisible = false
                     binding.readLoading.isVisible = true
                     binding.loadingText.apply {
@@ -990,10 +1302,12 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 }
 
                 is Resource.Failure -> {
+                    isProgressVisibleInOverlay = false
+                    binding.readNormalLayout.isVisible = false
+                    updateBottomOverlayVisibility()
                     binding.readLoading.isVisible = false
                     binding.readFail.isVisible = true
                     binding.failText.text = loading.errorString
-                    binding.readNormalLayout.isVisible = false
                 }
             }
         }
@@ -1090,6 +1404,10 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                         updateFromCode = false
                         onScroll()
                     }
+
+                    // Update on every scroll frame, not only when dy == 0 or scrolling
+                    // becomes idle. Otherwise the indicator appears frozen while reading.
+                    updateChapterReadingProgress()
 
                     super.onScrolled(recyclerView, dx, dy)
 
@@ -1311,6 +1629,14 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 setOnClickListener {
                     showFonts()
                 }
+            }
+
+            binding.readImportFont.setOnClickListener {
+                importFontLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream", "*/*"))
+            }
+
+            binding.readTextReplacements.setOnClickListener {
+                showTextReplacements()
             }
 
             binding.readSettingsTextFontText.setOnClickListener {
@@ -1645,5 +1971,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
             bottomSheetDialog.show()
         }
+        // Start asynchronous book loading only after the complete reader UI is ready.
+        viewModel.init(intent, this)
     }
 }
