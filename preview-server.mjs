@@ -7,12 +7,24 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.DEFAULT_APP_PORT) || 3000;
 const HOST = '0.0.0.0';
 
-const APK_PATH = path.join(__dirname, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+const CHUNK_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB per request (well below 32 MiB proxy response limit)
+const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
+
+const APK_PATHS = [
+  path.join(__dirname, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'),
+  path.join(__dirname, '.build-outputs', 'app-debug.apk'),
+];
 const ICON_PATH = path.join(__dirname, 'app', 'src', 'main', 'ic_launcher-playstore.png');
+const FAVICON_PATHS = [
+  path.join(__dirname, 'favicon.ico'),
+  path.join(__dirname, 'public', 'favicon.ico'),
+  path.join(__dirname, 'dist', 'favicon.ico'),
+  ICON_PATH,
+];
 
 const APP_TITLE = 'QuickNovel';
 const APP_DESCRIPTION =
-  'Browse, search, download as EPUB, and read web novels across multiple online sources with customizable reader themes, bionic reading, and text-to-speech.';
+  'Browse, search, download as EPUB, and read web novels across multiple online sources with customizable reader themes, bionic reading, text-to-speech, and full LNReader repository extensions.';
 
 function formatFileSize(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return 'Unavailable';
@@ -21,18 +33,37 @@ function formatFileSize(bytes) {
 }
 
 function getApkMeta() {
-  try {
-    const stats = fs.statSync(APK_PATH);
-    if (!stats.isFile()) return null;
-    return {
-      sizeBytes: stats.size,
-      sizeLabel: formatFileSize(stats.size),
-      updatedIso: stats.mtime.toISOString(),
-      updatedHuman: stats.mtime.toUTCString(),
-    };
-  } catch {
-    return null;
+  let newest = null;
+  for (const candidate of APK_PATHS) {
+    try {
+      const stats = fs.statSync(candidate);
+      if (!stats.isFile()) continue;
+      if (!newest || stats.mtimeMs > newest.mtimeMs) {
+        newest = {
+          filePath: candidate,
+          mtimeMs: stats.mtimeMs,
+          sizeBytes: stats.size,
+          sizeLabel: formatFileSize(stats.size),
+          updatedIso: stats.mtime.toISOString(),
+          updatedHuman: stats.mtime.toUTCString(),
+        };
+      }
+    } catch {
+      // Ignore missing candidate path
+    }
   }
+  return newest;
+}
+
+function resolveFaviconPath() {
+  for (const candidate of FAVICON_PATHS) {
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Ignore missing candidate path
+    }
+  }
+  return null;
 }
 
 function renderHtmlPage() {
@@ -40,11 +71,28 @@ function renderHtmlPage() {
   const hasIcon = fs.existsSync(ICON_PATH);
 
   const downloadAction = apkMeta
-    ? `<a class="btn-primary" href="/app-debug.apk" download="QuickNovel-debug.apk">Download Debug APK (${apkMeta.sizeLabel})</a>`
+    ? `<div class="download-box">
+        <button id="download-btn" class="btn-primary" type="button" data-size="${apkMeta.sizeBytes}">
+          Download Debug APK (${apkMeta.sizeLabel})
+        </button>
+        <div id="progress-wrap" class="progress-wrap" hidden>
+          <div class="progress-track">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <div id="progress-status" class="progress-status">Preparing download…</div>
+        </div>
+        <div id="fallback-link-wrap" class="fallback-row">
+          <span class="muted">Chunked browser transfer bypasses proxy size limits to deliver the complete ${apkMeta.sizeLabel} APK.</span>
+        </div>
+      </div>`
     : `<div class="notice">Debug APK not built yet. Run <code>./gradlew :app:assembleDebug</code> to generate <code>app/build/outputs/apk/debug/app-debug.apk</code>.</div>`;
 
   const updatedRow = apkMeta
     ? `<div class="meta-item"><span class="meta-label">Built</span><span class="meta-value">${apkMeta.updatedHuman}</span></div>`
+    : '';
+
+  const sizeRow = apkMeta
+    ? `<div class="meta-item"><span class="meta-label">APK Size</span><span class="meta-value">${apkMeta.sizeLabel} (${apkMeta.sizeBytes.toLocaleString()} B)</span></div>`
     : '';
 
   return `<!doctype html>
@@ -66,6 +114,8 @@ function renderHtmlPage() {
       --muted: #9aa4b5;
       --accent: #5b8cff;
       --accent-hover: #4779f0;
+      --error: #ff6b6b;
+      --success: #48e484;
     }
     * { box-sizing: border-box; }
     body {
@@ -141,9 +191,18 @@ function renderHtmlPage() {
       font-size: 0.9rem;
       word-break: break-word;
     }
+    .download-box {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
     .btn-primary {
       display: inline-block;
       width: 100%;
+      border: none;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.98rem;
       text-align: center;
       text-decoration: none;
       background: var(--accent);
@@ -151,10 +210,44 @@ function renderHtmlPage() {
       font-weight: 600;
       padding: 13px 18px;
       border-radius: 10px;
-      transition: background 0.15s ease;
+      transition: background 0.15s ease, opacity 0.15s ease;
     }
-    .btn-primary:hover {
+    .btn-primary:hover:not(:disabled) {
       background: var(--accent-hover);
+    }
+    .btn-primary:disabled {
+      opacity: 0.72;
+      cursor: progress;
+    }
+    .progress-wrap {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .progress-track {
+      height: 8px;
+      width: 100%;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 6px;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.12s linear;
+    }
+    .progress-status {
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+    .progress-status.error { color: var(--error); }
+    .progress-status.success { color: var(--success); }
+    .fallback-row {
+      font-size: 0.82rem;
+      color: var(--muted);
     }
     .notice {
       padding: 14px;
@@ -201,6 +294,7 @@ function renderHtmlPage() {
         <span class="meta-label">Compatibility</span>
         <span class="meta-value">Android 6.0+ (API 23–37)</span>
       </div>
+      ${sizeRow}
       ${updatedRow}
     </div>
     ${downloadAction}
@@ -208,8 +302,115 @@ function renderHtmlPage() {
       QuickNovel is a native Android application built with Gradle. Download the APK above to install and test on an Android device or emulator.
     </p>
   </main>
+  <script>
+    (function () {
+      const btn = document.getElementById('download-btn');
+      if (!btn) return;
+      const progressWrap = document.getElementById('progress-wrap');
+      const progressFill = document.getElementById('progress-fill');
+      const progressStatus = document.getElementById('progress-status');
+
+      function setStatus(text, stateClass) {
+        progressWrap.hidden = false;
+        progressStatus.textContent = text;
+        progressStatus.className = 'progress-status' + (stateClass ? ' ' + stateClass : '');
+      }
+
+      async function downloadChunkedApk() {
+        btn.disabled = true;
+        progressFill.style.width = '0%';
+        setStatus('Checking APK metadata…', '');
+
+        try {
+          const infoRes = await fetch('/apk-info', { cache: 'no-store' });
+          if (!infoRes.ok) throw new Error('Could not read APK metadata (HTTP ' + infoRes.status + ')');
+          const info = await infoRes.json();
+          if (!info.available || !info.sizeBytes) {
+            throw new Error('APK file is not available on the server.');
+          }
+
+          const totalBytes = info.sizeBytes;
+          const chunkSize = info.chunkSize || ${CHUNK_SIZE_BYTES};
+          const parts = [];
+          let received = 0;
+
+          while (received < totalBytes) {
+            const length = Math.min(chunkSize, totalBytes - received);
+            const chunkUrl = '/apk-chunk?offset=' + received + '&length=' + length + '&t=' + Date.now();
+            const res = await fetch(chunkUrl, { cache: 'no-store' });
+            if (!res.ok) {
+              throw new Error('Chunk transfer failed at byte ' + received + ' (HTTP ' + res.status + ')');
+            }
+            const buf = await res.arrayBuffer();
+            if (buf.byteLength !== length) {
+              throw new Error('Incomplete chunk received (' + buf.byteLength + ' of ' + length + ' bytes).');
+            }
+            if (received === 0) {
+              const header = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+              if (header[0] !== 0x50 || header[1] !== 0x4b) {
+                throw new Error('Downloaded header is not a valid Android APK archive.');
+              }
+            }
+            parts.push(buf);
+            received += buf.byteLength;
+            const pct = Math.min(100, Math.round((received / totalBytes) * 100));
+            const recvMb = (received / (1024 * 1024)).toFixed(1);
+            const totalMb = (totalBytes / (1024 * 1024)).toFixed(1);
+            progressFill.style.width = pct + '%';
+            setStatus('Downloading: ' + recvMb + ' / ' + totalMb + ' MB (' + pct + '%)', '');
+          }
+
+          const blob = new Blob(parts, { type: 'application/vnd.android.package-archive' });
+          if (blob.size !== totalBytes) {
+            throw new Error('Assembled APK size mismatch (' + blob.size + ' vs ' + totalBytes + ' bytes).');
+          }
+
+          const objectUrl = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = objectUrl;
+          link.download = info.filename || 'QuickNovel-debug.apk';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+
+          setStatus('Complete! Saved ' + (blob.size / (1024 * 1024)).toFixed(1) + ' MB APK.', 'success');
+        } catch (err) {
+          setStatus('Download error: ' + (err && err.message ? err.message : String(err)), 'error');
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      btn.addEventListener('click', downloadChunkedApk);
+    })();
+  </script>
 </body>
 </html>`;
+}
+
+function parseByteRange(rangeHeader, totalSize) {
+  if (!rangeHeader || typeof rangeHeader !== 'string') return null;
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
+  if (!match) return { invalid: true };
+  const startStr = match[1];
+  const endStr = match[2];
+  let start = 0;
+  let end = totalSize - 1;
+  if (startStr === '' && endStr === '') return { invalid: true };
+  if (startStr === '') {
+    const suffixLength = Number(endStr);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return { invalid: true };
+    start = Math.max(0, totalSize - suffixLength);
+    end = totalSize - 1;
+  } else {
+    start = Number(startStr);
+    end = endStr === '' ? totalSize - 1 : Math.min(totalSize - 1, Number(endStr));
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start >= totalSize || end < start) {
+    return { invalid: true };
+  }
+  return { start, end };
 }
 
 const server = http.createServer((req, res) => {
@@ -223,13 +424,105 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/health') {
-    const body = JSON.stringify({ ok: true, apkAvailable: Boolean(getApkMeta()) });
+    const meta = getApkMeta();
+    const body = JSON.stringify({
+      ok: true,
+      apkAvailable: Boolean(meta),
+      apkSizeBytes: meta ? meta.sizeBytes : 0,
+    });
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',
       'Content-Length': Buffer.byteLength(body),
       'Cache-Control': 'no-store',
     });
     res.end(method === 'HEAD' ? undefined : body);
+    return;
+  }
+
+  if (url.pathname === '/apk-info') {
+    const meta = getApkMeta();
+    const payload = meta
+      ? {
+          available: true,
+          filename: 'QuickNovel-debug.apk',
+          sizeBytes: meta.sizeBytes,
+          sizeLabel: meta.sizeLabel,
+          updatedIso: meta.updatedIso,
+          updatedHuman: meta.updatedHuman,
+          chunkSize: CHUNK_SIZE_BYTES,
+        }
+      : {
+          available: false,
+          filename: 'QuickNovel-debug.apk',
+          sizeBytes: 0,
+          sizeLabel: 'Unavailable',
+          chunkSize: CHUNK_SIZE_BYTES,
+        };
+    const body = JSON.stringify(payload);
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': Buffer.byteLength(body),
+      'Cache-Control': 'no-store',
+    });
+    res.end(method === 'HEAD' ? undefined : body);
+    return;
+  }
+
+  if (url.pathname === '/apk-chunk') {
+    const meta = getApkMeta();
+    if (!meta) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('APK not found.');
+      return;
+    }
+    const offset = Number(url.searchParams.get('offset') ?? '0');
+    const requestedLength = Number(url.searchParams.get('length') ?? String(CHUNK_SIZE_BYTES));
+    if (
+      !Number.isInteger(offset) ||
+      !Number.isInteger(requestedLength) ||
+      offset < 0 ||
+      offset >= meta.sizeBytes ||
+      requestedLength <= 0 ||
+      requestedLength > MAX_CHUNK_BYTES
+    ) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Invalid chunk offset or length.');
+      return;
+    }
+    const clampedLength = Math.min(requestedLength, meta.sizeBytes - offset);
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': clampedLength,
+      'Cache-Control': 'no-store',
+      'X-APK-Offset': String(offset),
+      'X-APK-Total-Size': String(meta.sizeBytes),
+    });
+    if (method === 'HEAD') {
+      res.end();
+      return;
+    }
+    fs.createReadStream(meta.filePath, { start: offset, end: offset + clampedLength - 1 }).pipe(res);
+    return;
+  }
+
+  if (url.pathname === '/favicon.ico') {
+    const faviconPath = resolveFaviconPath();
+    if (!faviconPath) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not Found');
+      return;
+    }
+    const stat = fs.statSync(faviconPath);
+    res.writeHead(200, {
+      'Content-Type': faviconPath.endsWith('.png') ? 'image/png' : 'image/x-icon',
+      'Content-Length': stat.size,
+      'Cache-Control': 'public, max-age=3600',
+    });
+    if (method === 'HEAD') {
+      res.end();
+      return;
+    }
+    fs.createReadStream(faviconPath).pipe(res);
     return;
   }
 
@@ -260,9 +553,36 @@ const server = http.createServer((req, res) => {
       res.end('APK not found. Run ./gradlew :app:assembleDebug first.');
       return;
     }
+    const range = parseByteRange(req.headers.range, apkMeta.sizeBytes);
+    if (range && range.invalid) {
+      res.writeHead(416, {
+        'Content-Range': `bytes */${apkMeta.sizeBytes}`,
+        'Content-Type': 'text/plain; charset=utf-8',
+      });
+      res.end('Range Not Satisfiable');
+      return;
+    }
+    if (range) {
+      const length = range.end - range.start + 1;
+      res.writeHead(206, {
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Disposition': 'attachment; filename="QuickNovel-debug.apk"',
+        'Accept-Ranges': 'bytes',
+        'Content-Range': `bytes ${range.start}-${range.end}/${apkMeta.sizeBytes}`,
+        'Content-Length': length,
+        'Cache-Control': 'no-store',
+      });
+      if (method === 'HEAD') {
+        res.end();
+        return;
+      }
+      fs.createReadStream(apkMeta.filePath, { start: range.start, end: range.end }).pipe(res);
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'application/vnd.android.package-archive',
       'Content-Disposition': 'attachment; filename="QuickNovel-debug.apk"',
+      'Accept-Ranges': 'bytes',
       'Content-Length': apkMeta.sizeBytes,
       'Cache-Control': 'no-store',
     });
@@ -270,7 +590,7 @@ const server = http.createServer((req, res) => {
       res.end();
       return;
     }
-    fs.createReadStream(APK_PATH).pipe(res);
+    fs.createReadStream(apkMeta.filePath).pipe(res);
     return;
   }
 

@@ -755,7 +755,8 @@ class ReadActivityViewModel : ViewModel() {
             }
 
             is Resource.Success -> {
-                data.value.spans
+                val showOriginal = isShowingOriginalLive.value == true && isTranslationActiveLive.value == true
+                if (showOriginal) data.value.originalSpans else data.value.spans
             }
 
             is Resource.Failure -> listOf<SpanDisplay>(
@@ -806,7 +807,7 @@ class ReadActivityViewModel : ViewModel() {
         }
     }
 
-    private fun updateReadArea(seekToDesired: Boolean = false) {
+    fun updateReadArea(seekToDesired: Boolean = false) {
         val cIndex = currentIndex
         val chapters = ArrayList<SpanDisplay>()
         val canReload = this.book.canReload
@@ -1285,11 +1286,14 @@ class ReadActivityViewModel : ViewModel() {
                 translationManager.prepareModel(settings.from, settings.to, downloadIfNeeded = allowDownload)
             }
             mlSettings = settings
+            isTranslationActiveLive.postValue(settings.isValid())
         } catch (_: TimeoutException) {
             showToast(R.string.unable_to_download_language)
             translationManager.release()
+            isTranslationActiveLive.postValue(false)
         } catch (t: Throwable) {
             logError(t)
+            isTranslationActiveLive.postValue(false)
         }
     }
 
@@ -2053,6 +2057,26 @@ class ReadActivityViewModel : ViewModel() {
     var showTime by PreferenceDelegateLiveView(
         EPUB_HAS_TIME, true, Boolean::class, showTimeLive
     )
+
+    val showReaderProgressLive: MutableLiveData<Boolean> = MutableLiveData(true)
+    var showReaderProgress by PreferenceDelegateLiveView(
+        EPUB_SHOW_READER_PROGRESS, true, Boolean::class, showReaderProgressLive
+    )
+
+    val autoScrollEnabledLive: MutableLiveData<Boolean> = MutableLiveData(false)
+    val autoScrollSpeedLive: MutableLiveData<Float> = MutableLiveData(3f)
+    var autoScrollSpeed by PreferenceDelegateLiveView(
+        EPUB_AUTO_SCROLL_SPEED, 3f, Float::class, autoScrollSpeedLive
+    )
+
+    val isTranslationActiveLive: MutableLiveData<Boolean> = MutableLiveData(false)
+    val isShowingOriginalLive: MutableLiveData<Boolean> = MutableLiveData(false)
+
+    fun toggleShowOriginal() {
+        val next = !(isShowingOriginalLive.value ?: false)
+        isShowingOriginalLive.postValue(next)
+        updateReadArea(seekToDesired = false)
+    }
 
     val paddingHorizontalLive: MutableLiveData<Int> = MutableLiveData(null)
     var paddingHorizontal by PreferenceDelegateLiveView(

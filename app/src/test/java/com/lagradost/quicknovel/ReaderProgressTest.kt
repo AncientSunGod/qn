@@ -91,5 +91,57 @@ class ReaderProgressTest {
             ),
         )
     }
+
+    @Test
+    fun neoQnChapterProgressTracksCurrentChapterSmoothlyAndNeverResetsOnMissingFrame() {
+        val items = listOf(0, 0, 1, 1, 1, 1, 1, 1, 2, 2)
+        // Chapter 1 spans indices 2..7 (6 items)
+        assertEquals(
+            0f,
+            calculateNeoQnChapterProgress(
+                itemIndices = items,
+                currentChapterIndex = 1,
+                firstVisiblePosition = 2,
+                lastVisiblePosition = 4,
+                canScrollDown = true,
+                firstVisibleScrolledFraction = 0f,
+            )!!,
+            0.001f,
+        )
+        val mid = calculateNeoQnChapterProgress(
+            itemIndices = items,
+            currentChapterIndex = 1,
+            firstVisiblePosition = 3,
+            lastVisiblePosition = 5,
+            canScrollDown = true,
+            firstVisibleScrolledFraction = 0.5f,
+        )!!
+        assertEquals(0.5f, mid, 0.001f)
+        // Reaching bottom of chapter when cannot scroll down hits 1f
+        assertEquals(
+            1f,
+            calculateNeoQnChapterProgress(
+                itemIndices = items,
+                currentChapterIndex = 1,
+                firstVisiblePosition = 5,
+                lastVisiblePosition = 7,
+                canScrollDown = false,
+                firstVisibleScrolledFraction = 0f,
+            )!!,
+            0.001f,
+        )
+        // Transition frame lacking current chapter returns null so caller preserves previous value
+        assertEquals(
+            null,
+            calculateNeoQnChapterProgress(
+                itemIndices = items,
+                currentChapterIndex = 5,
+                firstVisiblePosition = 0,
+                lastVisiblePosition = 2,
+                canScrollDown = true,
+            ),
+        )
+    }
 }
+
 

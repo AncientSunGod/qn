@@ -56,3 +56,52 @@ internal fun resolveEffectiveReaderProgress(
     )
 }
 
+/**
+ * Computes NeoQN-style chapter reading progress in [0f, 1f] for the active chapter.
+ * Returns null when the adapter does not currently contain items for the active chapter
+ * so callers can preserve the last stable value across chapter-boundary list updates.
+ */
+internal fun calculateNeoQnChapterProgress(
+    itemIndices: List<Int>,
+    currentChapterIndex: Int,
+    firstVisiblePosition: Int,
+    lastVisiblePosition: Int,
+    canScrollDown: Boolean,
+    firstVisibleScrolledFraction: Float = 0f,
+): Float? {
+    if (itemIndices.isEmpty()) return 0f
+
+    var firstPos = -1
+    var lastPos = -1
+    for (i in itemIndices.indices) {
+        if (itemIndices[i] == currentChapterIndex) {
+            if (firstPos == -1) firstPos = i
+            lastPos = i
+        } else if (firstPos != -1) {
+            break
+        }
+    }
+    if (firstPos == -1) return null
+
+    if (!canScrollDown && lastVisiblePosition >= lastPos) {
+        return 1f
+    }
+
+    val safeFirstVisible = firstVisiblePosition.coerceAtLeast(0)
+    val safeLastVisible = lastVisiblePosition.coerceAtLeast(safeFirstVisible)
+    val visibleCount = (safeLastVisible - safeFirstVisible).coerceAtLeast(0)
+    val maxFirstVisible = (lastPos - visibleCount).coerceAtLeast(firstPos)
+    val range = if (maxFirstVisible > firstPos) {
+        (maxFirstVisible - firstPos).toFloat()
+    } else {
+        (lastPos - firstPos).coerceAtLeast(1).toFloat()
+    }
+    val subItemOffset = if (safeFirstVisible >= firstPos) {
+        firstVisibleScrolledFraction.coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    return (((safeFirstVisible - firstPos) + subItemOffset) / range).coerceIn(0f, 1f)
+}
+
+

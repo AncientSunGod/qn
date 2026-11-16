@@ -95,7 +95,11 @@ class ExtensionMainAPI internal constructor(
         null
     }
     override val hasMainPage: Boolean = true
-    override val orderBys: List<Pair<String, String>> by lazy { filterOptions(0) }
+    override val orderBys: List<Pair<String, String>> by lazy {
+        filterOptions(0).ifEmpty {
+            listOf("Popular" to "popular", "Latest" to "latest")
+        }
+    }
     override val mainCategories: List<Pair<String, String>> by lazy { filterOptions(1) }
     override val tags: List<Pair<String, String>> by lazy {
         filterOptions(2).ifEmpty {
@@ -258,7 +262,7 @@ class ExtensionMainAPI internal constructor(
     }
 
     private fun mapSearchItems(json: String): List<SearchResponse> {
-        val array = JSONArray(json)
+        val array = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
         return buildList {
             for (index in 0 until array.length()) {
                 val item = array.optJSONObject(index) ?: continue
@@ -402,7 +406,8 @@ class ExtensionMainAPI internal constructor(
     }
 
     private fun resolveHttpUrl(value: String): String? = runCatching {
-        val uri = URI(mainUrl + "/").resolve(value).normalize()
+        val sanitized = value.trim().replace(" ", "%20")
+        val uri = URI(mainUrl + "/").resolve(sanitized).normalize()
         require(uri.scheme == "http" || uri.scheme == "https")
         require(!uri.host.isNullOrBlank() && uri.userInfo == null)
         uri.toString()

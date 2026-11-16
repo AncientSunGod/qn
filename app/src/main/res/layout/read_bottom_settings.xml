@@ -78,6 +78,11 @@
                     android:text="@string/show_battery" />
 
                 <com.google.android.material.checkbox.MaterialCheckBox
+                    android:id="@+id/read_settings_show_progress"
+                    style="@style/WhiteCheckmark"
+                    android:text="@string/show_reading_progress" />
+
+                <com.google.android.material.checkbox.MaterialCheckBox
                     android:id="@+id/read_settings_show_bionic"
                     style="@style/WhiteCheckmark"
                     android:text="@string/bionic_reading" />
@@ -96,6 +101,38 @@
                     android:id="@+id/read_settings_author_notes"
                     style="@style/WhiteCheckmark"
                     android:text="@string/show_authors_notes" />
+
+                <com.google.android.material.checkbox.MaterialCheckBox
+                    android:id="@+id/read_settings_auto_scroll"
+                    style="@style/WhiteCheckmark"
+                    android:text="@string/auto_scroll" />
+
+                <TextView
+                    android:id="@+id/read_settings_auto_scroll_speed_text"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/auto_scroll_speed"
+                    android:textSize="14sp" />
+
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/read_settings_auto_scroll_speed"
+                    style="@style/SettingsSliderTheme"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:stepSize="0.5"
+                    android:value="3.0"
+                    android:valueFrom="1.0"
+                    android:valueTo="10.0" />
+
+                <TextView
+                    android:id="@+id/read_settings_reading_time"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:textColor="?attr/grayTextColor"
+                    android:textSize="13sp"
+                    tools:text="Total reading time: 15m" />
 
                 <TextView
                     android:layout_width="wrap_content"

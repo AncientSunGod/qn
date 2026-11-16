@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="?attr/colorControlHighlight">
+    <item android:id="@android:id/mask">
+        <shape>
+            <corners android:radius="16dp" />
+            <solid android:color="@android:color/white" />
+        </shape>
+    </item>
+    <item>
+        <layer-list>
+            <item>
+                <shape>
+                    <solid android:color="#1A000000" />
+                    <corners android:radius="16dp" />
+                </shape>
+            </item>
+            <item>
+                <shape>
+                    <solid android:color="?attr/floatingNavBackground" />
+                    <corners android:radius="16dp" />
+                </shape>
+            </item>
+            <item>
+                <shape>
+                    <stroke
+                        android:width="1.2dp"
+                        android:color="?attr/floatingNavStroke" />
+                    <corners android:radius="16dp" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+</ripple>

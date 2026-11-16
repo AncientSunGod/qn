@@ -43,5 +43,7 @@
         <attr name="grayTextColor" format="color" />
         <attr name="iconColor" format="color" />
         <attr name="white" format="color" />
+        <attr name="floatingNavBackground" format="color" />
+        <attr name="floatingNavStroke" format="color" />
     </declare-styleable>
 </resources>

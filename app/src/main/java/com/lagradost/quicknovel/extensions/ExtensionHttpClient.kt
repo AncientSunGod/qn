@@ -84,9 +84,15 @@ object ExtensionHttpClient {
         "cookie",
         "origin",
         "content-type",
+        "accept-encoding",
         "x-requested-with",
         "x-csrf-token",
+        "x-api-key",
+        "x-auth-token",
+        "x-client",
         "x-goog-api-key",
+        "x-grpc-web",
+        "grpc-accept-encoding",
         "x-accepts-encrypted-content",
         "baggage",
         "sentry-trace",
@@ -123,8 +129,7 @@ object ExtensionHttpClient {
     )
 
     /**
-     * Executes a bounded GET or POST request. Request bodies are UTF-8 strings only;
-     * arbitrary binary and multipart uploads are intentionally unsupported.
+     * Executes a bounded HTTP request (GET, HEAD, POST, PUT, DELETE, or PATCH).
      */
     fun requestText(
         rawUrl: String,
@@ -133,15 +138,16 @@ object ExtensionHttpClient {
         headers: Map<String, String> = emptyMap(),
         allowedHosts: Set<String>? = null,
         responseEncoding: String? = null,
+        bodyBytes: ByteArray? = null,
     ): Result<TextResponse> = runCatching {
         var currentUrl = validateUrl(rawUrl, allowedHosts)
         var currentMethod = method.trim().uppercase(Locale.ROOT)
-        var currentBody = body?.toByteArray(Charsets.UTF_8)
-        require(currentMethod == "GET" || currentMethod == "POST") {
-            "Extension requests currently support GET and POST only."
+        var currentBody = bodyBytes ?: body?.toByteArray(Charsets.UTF_8)
+        require(currentMethod in setOf("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH")) {
+            "Unsupported extension HTTP method: $currentMethod"
         }
-        require(currentMethod != "GET" || currentBody == null) {
-            "GET requests may not include a request body."
+        require((currentMethod != "GET" && currentMethod != "HEAD") || currentBody == null) {
+            "$currentMethod requests may not include a request body."
         }
         require(currentBody == null || currentBody.size <= MAX_REQUEST_BYTES) {
             "Extension request body exceeds the 256 KB limit."
@@ -225,7 +231,7 @@ object ExtensionHttpClient {
                     browserUserAgent?.takeIf { it.isNotBlank() }
                         ?: com.lagradost.quicknovel.USER_AGENT
                 )
-                if (currentMethod == "POST") {
+                if (currentMethod in setOf("POST", "PUT", "PATCH") || (currentMethod == "DELETE" && currentBody != null)) {
                     connection.doOutput = true
                     currentBody?.let { bytes ->
                         connection.setFixedLengthStreamingMode(bytes.size)
@@ -295,22 +301,26 @@ object ExtensionHttpClient {
                     return@repeat
                 }
 
-                val stream = if (status >= 400) connection.errorStream else connection.inputStream
-                val bodyBytes = stream?.use { input ->
-                    val output = ByteArrayOutputStream()
-                    val buffer = ByteArray(8192)
-                    var total = 0
-                    while (true) {
-                        val count = input.read(buffer)
-                        if (count < 0) break
-                        total += count
-                        require(total <= MAX_RESPONSE_BYTES) {
-                            "Extension response exceeds the 8 MB limit."
+                val bodyBytes = if (currentMethod == "HEAD") {
+                    ByteArray(0)
+                } else {
+                    val stream = if (status >= 400) connection.errorStream else connection.inputStream
+                    stream?.use { input ->
+                        val output = ByteArrayOutputStream()
+                        val buffer = ByteArray(8192)
+                        var total = 0
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            total += count
+                            require(total <= MAX_RESPONSE_BYTES) {
+                                "Extension response exceeds the 8 MB limit."
+                            }
+                            output.write(buffer, 0, count)
                         }
-                        output.write(buffer, 0, count)
-                    }
-                    output.toByteArray()
-                } ?: ByteArray(0)
+                        output.toByteArray()
+                    } ?: ByteArray(0)
+                }
 
                 val responseHeaders = connection.headerFields.entries
                     .filter { it.key != null && it.value?.isNotEmpty() == true }
@@ -382,9 +392,7 @@ object ExtensionHttpClient {
         require(host != "localhost" && !host.endsWith(".localhost")) {
             "Localhost extension requests are blocked."
         }
-        require(allowedHosts == null || allowedHosts.any {
-            host.equals(it.lowercase(Locale.ROOT).trimEnd('.'), ignoreCase = true)
-        }) {
+        require(allowedHosts == null || isHostApproved(host, allowedHosts)) {
             "Extension request host is outside the approved site."
         }
         if (allowedHosts != null) {
@@ -410,5 +418,25 @@ object ExtensionHttpClient {
             }
         }
         return parsed.toURI().normalize().toString()
+    }
+
+    private val sharedMultiTenantSuffixes = setOf(
+        "blogspot.com", "wordpress.com", "github.io", "gitlab.io",
+        "netlify.app", "vercel.app", "herokuapp.com", "pages.dev",
+        "workers.dev", "onrender.com", "appspot.com",
+    )
+
+    internal fun isHostApproved(rawHost: String, allowedHosts: Set<String>): Boolean {
+        val host = rawHost.lowercase(Locale.ROOT).trimEnd('.')
+        return allowedHosts.any { rawAllowed ->
+            val allowed = rawAllowed.lowercase(Locale.ROOT).trimEnd('.')
+            if (host == allowed) return@any true
+            val base = allowed.removePrefix("www.")
+            if (base.count { it == '.' } >= 1 && base !in sharedMultiTenantSuffixes) {
+                host == base || host.endsWith(".$base")
+            } else {
+                false
+            }
+        }
     }
 }

@@ -332,4 +332,10 @@
     <string name="unable_to_inflate">UI was unable to be created correctly, this is a MAJOR BUG and should be reported immediately %s</string>
     <string name="import_custom_font">Import custom font</string>
     <string name="custom_text_replacements">Custom text replacements</string>
+    <string name="show_reading_progress">Show reading progress bar</string>
+    <string name="a11y_translate_toggle">Toggle Original / Translated</string>
+    <string name="auto_scroll">Auto-scroll</string>
+    <string name="auto_scroll_speed">Auto-scroll speed</string>
+    <string name="reading_timer_title">Reading time</string>
+    <string name="reading_timer_format" formatted="true">Total reading time: %s</string>
 </resources>

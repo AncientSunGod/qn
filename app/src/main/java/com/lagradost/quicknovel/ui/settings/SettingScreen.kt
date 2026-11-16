@@ -20,17 +20,23 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -74,6 +80,7 @@ import com.lagradost.quicknovel.ui.txt
 import com.lagradost.quicknovel.util.Apis.Companion.apis
 import com.lagradost.quicknovel.util.Apis.Companion.getApiSettings
 import com.lagradost.quicknovel.util.Apis.Companion.getInstalledExtensionProviderInfo
+import com.lagradost.quicknovel.extensions.ExtensionRepositoryManager
 import com.lagradost.quicknovel.extensions.ExtensionSettingsManager
 import com.lagradost.quicknovel.extensions.ExtensionSetting
 import com.lagradost.quicknovel.extensions.InstalledExtension
@@ -279,19 +286,29 @@ object SettingScreen : SearchableSettings {
                             var repositoryStatus by remember { mutableStateOf("Add an LNReader-compatible repository manifest URL.") }
                             var repositoryRefreshing by remember { mutableStateOf(false) }
                             var extensionSearchQuery by remember { mutableStateOf("") }
+                            var selectedLanguageFilter by remember { mutableStateOf("All") }
                             var pendingExtensionInstall by remember { mutableStateOf<com.lagradost.quicknovel.extensions.ExtensionListing?>(null) }
                             var pendingExtensionSettings by remember { mutableStateOf<InstalledExtension?>(null) }
                             var pluginSettings by remember { mutableStateOf(emptyList<ExtensionSetting>()) }
                             var pluginSettingsLoading by remember { mutableStateOf(false) }
                             var pluginSettingsSaving by remember { mutableStateOf(false) }
                             var pluginSettingsStatus by remember { mutableStateOf("") }
+                            val availableLanguages = remember(extensionListings) {
+                                listOf("All") + extensionListings
+                                    .mapNotNull { it.language.trim().takeIf(String::isNotEmpty) }
+                                    .distinct()
+                                    .sorted()
+                            }
                             val filteredExtensionListings = extensionListings.filter { entry ->
+                                val matchesLanguage = selectedLanguageFilter == "All" ||
+                                    entry.language.equals(selectedLanguageFilter, ignoreCase = true)
                                 val query = extensionSearchQuery.trim()
-                                query.isBlank() ||
+                                val matchesQuery = query.isBlank() ||
                                     entry.name.contains(query, ignoreCase = true) ||
                                     entry.site.contains(query, ignoreCase = true) ||
                                     entry.language.contains(query, ignoreCase = true) ||
                                     entry.id.contains(query, ignoreCase = true)
+                                matchesLanguage && matchesQuery
                             }
 
                             fun openPluginSettings(extension: InstalledExtension) {
@@ -325,156 +342,266 @@ object SettingScreen : SearchableSettings {
                                 repositoryRefreshing = true
                                 scope.launch {
                                     val result = withContext(Dispatchers.IO) {
-                                        com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.refresh(context)
+                                        ExtensionRepositoryManager.refresh(context)
                                     }
                                     result.onSuccess { entries ->
                                         extensionListings = entries
-                                        val warning = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.lastRefreshWarning
+                                        val warning = ExtensionRepositoryManager.lastRefreshWarning
                                         repositoryStatus = if (warning == null) {
-                                            "Loaded ${entries.size} extension listings. Compatibility is partial: some plugins may fail if they require unsupported LNReader modules."
+                                            "Loaded ${entries.size} extension listings."
                                         } else {
-                                            "Loaded ${entries.size} extension listings, but one or more repositories failed: ${warning}"
+                                            "Loaded ${entries.size} extension listings, with warning: $warning"
                                         }
                                     }.onFailure { error ->
                                         repositoryStatus = error.message ?: "Could not refresh repositories."
                                     }
                                     repositoryRefreshing = false
-                                    extensionRepositories = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.getRepositories(context)
-                                    installedExtensions = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.getInstalledExtensions(context)
+                                    extensionRepositories = ExtensionRepositoryManager.getRepositories(context)
+                                    installedExtensions = ExtensionRepositoryManager.getInstalledExtensions(context)
                                 }
                             }
 
                             TextPreferenceWidget(
                                 title = "Extension repositories",
-                                subtitle = "Add repositories and browse their extension manifests. Install only extensions from sources you trust.",
+                                subtitle = "Add LNReader repositories, filter by language, and install sources.",
                                 icon = painterResource(R.drawable.extension_24px),
                                 onPreferenceClick = {
-                                    extensionRepositories = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.getRepositories(context)
+                                    extensionRepositories = ExtensionRepositoryManager.getRepositories(context)
+                                    installedExtensions = ExtensionRepositoryManager.getInstalledExtensions(context)
                                     repositoryDialogOpen = true
+                                    if (extensionRepositories.isNotEmpty() && extensionListings.isEmpty() && !repositoryRefreshing) {
+                                        refreshExtensionCatalog()
+                                    }
                                 }
                             )
                             if (repositoryDialogOpen) {
+                                val officialAdded = extensionRepositories.any {
+                                    it.equals(ExtensionRepositoryManager.OFFICIAL_LNREADER_REPO_URL, ignoreCase = true)
+                                }
                                 AlertDialog(
                                     onDismissRequest = { repositoryDialogOpen = false },
+                                    properties = DialogProperties(usePlatformDefaultWidth = false),
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                                     title = { Text("Extension repositories") },
                                     text = {
                                         LazyColumn(
-                                            modifier = Modifier.fillMaxWidth(),
+                                            modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
                                             verticalArrangement = Arrangement.spacedBy(8.dp)
                                         ) {
                                             item {
-                                                Text("Add an LNReader-compatible manifest URL ending in plugins.min.json.")
-                                                Text("Security: extension JavaScript runs inside the app process. Install only extensions from repositories and authors you trust; this is not an isolated sandbox.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                                                Text(
+                                                    "Add an LNReader-compatible manifest URL (plugins.min.json).",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                )
+                                                Text(
+                                                    "Security: extension JavaScript runs inside the app process. Install only extensions from repositories you trust.",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.error,
+                                                )
+                                                Spacer(modifier = Modifier.height(6.dp))
+                                                if (!officialAdded) {
+                                                    Button(
+                                                        onClick = {
+                                                            ExtensionRepositoryManager.addRepository(
+                                                                context,
+                                                                ExtensionRepositoryManager.OFFICIAL_LNREADER_REPO_URL,
+                                                            ).onSuccess { updated ->
+                                                                extensionRepositories = updated
+                                                                refreshExtensionCatalog()
+                                                            }.onFailure { error ->
+                                                                repositoryStatus = error.message ?: "Could not add official LNReader repo."
+                                                            }
+                                                        },
+                                                        enabled = !repositoryRefreshing,
+                                                        modifier = Modifier.fillMaxWidth(),
+                                                    ) {
+                                                        Text("Add Official LNReader Repo (370+ sources)")
+                                                    }
+                                                }
                                                 OutlinedTextField(
                                                     value = repositoryUrlInput,
                                                     onValueChange = { repositoryUrlInput = it },
-                                                    label = { Text("Repository manifest URL") },
+                                                    label = { Text("Custom repository manifest URL") },
                                                     singleLine = true,
                                                     modifier = Modifier.fillMaxWidth()
                                                 )
-                                                Button(
-                                                    onClick = {
-                                                        val result = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.addRepository(context, repositoryUrlInput)
-                                                        result.onSuccess { updated ->
-                                                            extensionRepositories = updated
-                                                            repositoryUrlInput = ""
-                                                            repositoryStatus = "Repository added. Tap Refresh to load its catalogue."
-                                                        }.onFailure { error ->
-                                                            repositoryStatus = error.message ?: "Could not add repository."
-                                                        }
-                                                    },
-                                                    enabled = repositoryUrlInput.isNotBlank()
-                                                ) { Text("Add repository") }
-                                                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                                                ) {
+                                                    OutlinedButton(
+                                                        onClick = {
+                                                            val result = ExtensionRepositoryManager.addRepository(context, repositoryUrlInput)
+                                                            result.onSuccess { updated ->
+                                                                extensionRepositories = updated
+                                                                repositoryUrlInput = ""
+                                                                refreshExtensionCatalog()
+                                                            }.onFailure { error ->
+                                                                repositoryStatus = error.message ?: "Could not add repository."
+                                                            }
+                                                        },
+                                                        enabled = repositoryUrlInput.isNotBlank() && !repositoryRefreshing,
+                                                    ) { Text("Add") }
                                                     Button(
                                                         onClick = { refreshExtensionCatalog() },
                                                         enabled = !repositoryRefreshing && extensionRepositories.isNotEmpty()
-                                                    ) { Text(if (repositoryRefreshing) "Refreshing…" else "Refresh catalogue") }
+                                                    ) { Text(if (repositoryRefreshing) "Refreshing…" else "Refresh") }
                                                     if (repositoryRefreshing) {
                                                         androidx.compose.material3.CircularProgressIndicator(
-                                                            modifier = Modifier.padding(start = 12.dp).size(20.dp),
+                                                            modifier = Modifier.size(20.dp),
                                                             strokeWidth = 2.dp
                                                         )
                                                     }
                                                 }
-                                                Text(repositoryStatus, style = MaterialTheme.typography.bodySmall)
+                                                Text(
+                                                    repositoryStatus,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                                Spacer(modifier = Modifier.height(4.dp))
                                                 Text("Repositories (${extensionRepositories.size})", style = MaterialTheme.typography.titleSmall)
                                             }
                                             items(extensionRepositories) { repository ->
-                                                Row(
+                                                Surface(
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    tonalElevation = 1.dp,
                                                     modifier = Modifier.fillMaxWidth(),
-                                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
                                                 ) {
-                                                    Text(repository, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                                                    TextButton(onClick = {
-                                                        extensionRepositories = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.removeRepository(context, repository)
-                                                        extensionListings = extensionListings.filterNot { it.repositoryUrl == repository }
-                                                        repositoryStatus = "Repository removed."
-                                                    }) { Text("Remove") }
+                                                    Row(
+                                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                                                    ) {
+                                                        Text(repository, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                                                        TextButton(onClick = {
+                                                            extensionRepositories = ExtensionRepositoryManager.removeRepository(context, repository)
+                                                            extensionListings = extensionListings.filterNot { it.repositoryUrl == repository }
+                                                            repositoryStatus = "Repository removed."
+                                                        }) { Text("Remove") }
+                                                    }
                                                 }
                                             }
-                                            item {
-                                                Text("Installed bundles (${installedExtensions.size})", style = MaterialTheme.typography.titleSmall)
-                                                Text("Installed extensions are registered as providers, but compatibility is partial. Unsupported imports may cause search or reading to fail.", style = MaterialTheme.typography.bodySmall)
-                                            }
-                                            items(installedExtensions) { installed ->
-                                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                    Text(installed.name, style = MaterialTheme.typography.bodyMedium)
-                                                    Text("${installed.site} · ${installed.language} · ${installed.version}", style = MaterialTheme.typography.bodySmall)
-                                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                        if (installed.hasSettings) {
-                                                            TextButton(onClick = { openPluginSettings(installed) }) { Text("Settings") }
-                                                        }
-                                                        TextButton(onClick = {
-                                                            val removedProvider = getInstalledExtensionProviderInfo(context)
-                                                                .firstOrNull { it.id == installed.id }
-                                                            val removed = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.uninstall(context, installed.id)
-                                                            installedExtensions = com.lagradost.quicknovel.extensions.ExtensionRepositoryManager.getInstalledExtensions(context)
-                                                            if (removed) {
-                                                                removedProvider?.let { provider ->
-                                                                    settings.provider.searchProvidersList.set(
-                                                                        settings.provider.searchProvidersList.get() - provider.name
-                                                                    )
-                                                                }
-                                                                APIRepository.providersActive = context.getApiSettings()
-                                                                com.lagradost.quicknovel.extensions.ExtensionProviderRegistry.notifyChanged()
-                                                                repositoryStatus = "${installed.name} uninstalled. Providers refreshed."
-                                                            } else {
-                                                                repositoryStatus = "Could not uninstall ${installed.name}."
+                                            if (installedExtensions.isNotEmpty()) {
+                                                item {
+                                                    Text("Installed (${installedExtensions.size})", style = MaterialTheme.typography.titleSmall)
+                                                }
+                                                items(installedExtensions, key = { "installed:${it.id}" }) { installed ->
+                                                    Surface(
+                                                        shape = RoundedCornerShape(10.dp),
+                                                        tonalElevation = 2.dp,
+                                                        modifier = Modifier.fillMaxWidth(),
+                                                    ) {
+                                                        Row(
+                                                            modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                                                        ) {
+                                                            Column(
+                                                                modifier = Modifier.weight(1f),
+                                                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                                                            ) {
+                                                                Text(installed.name, style = MaterialTheme.typography.bodyMedium)
+                                                                Text(
+                                                                    "${installed.language} · v${installed.version} · ${installed.site}",
+                                                                    style = MaterialTheme.typography.bodySmall,
+                                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                                )
                                                             }
-                                                        }) { Text("Uninstall") }
+                                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                                if (installed.hasSettings) {
+                                                                    TextButton(onClick = { openPluginSettings(installed) }) { Text("Settings") }
+                                                                }
+                                                                TextButton(onClick = {
+                                                                    val removedProvider = getInstalledExtensionProviderInfo(context)
+                                                                        .firstOrNull { it.id == installed.id }
+                                                                    val removed = ExtensionRepositoryManager.uninstall(context, installed.id)
+                                                                    installedExtensions = ExtensionRepositoryManager.getInstalledExtensions(context)
+                                                                    if (removed) {
+                                                                        removedProvider?.let { provider ->
+                                                                            settings.provider.searchProvidersList.set(
+                                                                                settings.provider.searchProvidersList.get() - provider.name
+                                                                            )
+                                                                        }
+                                                                        APIRepository.providersActive = context.getApiSettings()
+                                                                        com.lagradost.quicknovel.extensions.ExtensionProviderRegistry.notifyChanged()
+                                                                        repositoryStatus = "${installed.name} uninstalled. Providers refreshed."
+                                                                    } else {
+                                                                        repositoryStatus = "Could not uninstall ${installed.name}."
+                                                                    }
+                                                                }) { Text("Uninstall") }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                             item {
-                                                Text("Available extensions (${filteredExtensionListings.size} of ${extensionListings.size})", style = MaterialTheme.typography.titleSmall)
+                                                Text(
+                                                    "Available extensions (${filteredExtensionListings.size} of ${extensionListings.size})",
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                )
                                                 OutlinedTextField(
                                                     value = extensionSearchQuery,
                                                     onValueChange = { extensionSearchQuery = it },
-                                                    label = { Text("Search extensions by name, site, ID or language") },
+                                                    label = { Text("Search name, site, ID or language") },
                                                     singleLine = true,
                                                     modifier = Modifier.fillMaxWidth()
                                                 )
+                                                if (availableLanguages.size > 1) {
+                                                    LazyRow(
+                                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                    ) {
+                                                        items(availableLanguages) { language ->
+                                                            FilterChip(
+                                                                selected = selectedLanguageFilter == language,
+                                                                onClick = { selectedLanguageFilter = language },
+                                                                label = { Text(language) },
+                                                            )
+                                                        }
+                                                    }
+                                                }
                                             }
-                                            items(filteredExtensionListings) { entry ->
+                                            items(filteredExtensionListings, key = { "${it.repositoryUrl}:${it.id}" }) { entry ->
                                                 val installed = installedExtensions.firstOrNull { it.id == entry.id }
-                                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                    Text(entry.name, style = MaterialTheme.typography.bodyMedium)
-                                                    Text("${entry.site} · ${entry.language} · ${entry.version}", style = MaterialTheme.typography.bodySmall)
-                                                    Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                                Surface(
+                                                    shape = RoundedCornerShape(10.dp),
+                                                    tonalElevation = 1.dp,
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                                                    ) {
+                                                        Column(
+                                                            modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                                                        ) {
+                                                            Text(entry.name, style = MaterialTheme.typography.bodyMedium)
+                                                            Text(
+                                                                "${entry.language} · v${entry.version} · ${entry.site}",
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            )
+                                                        }
                                                         Button(
                                                             onClick = { pendingExtensionInstall = entry },
                                                             enabled = !repositoryRefreshing
-                                                        ) { Text(if (installed == null) "Install" else "Update") }
-                                                        if (installed != null) {
-                                                            Text("Installed", style = MaterialTheme.typography.bodySmall)
+                                                        ) {
+                                                            Text(
+                                                                when {
+                                                                    installed == null -> "Install"
+                                                                    installed.version != entry.version -> "Update"
+                                                                    else -> "Reinstall"
+                                                                }
+                                                            )
                                                         }
                                                     }
                                                 }
                                             }
                                             if (filteredExtensionListings.isEmpty() && extensionListings.isNotEmpty()) {
-                                                item { Text("No extensions match this search.", style = MaterialTheme.typography.bodySmall) }
+                                                item { Text("No extensions match this filter.", style = MaterialTheme.typography.bodySmall) }
                                             }
                                         }
                                     },

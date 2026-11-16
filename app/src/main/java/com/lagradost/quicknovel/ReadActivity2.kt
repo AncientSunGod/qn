@@ -40,6 +40,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.children
 import androidx.core.view.isGone
 import androidx.core.view.isVisible
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomsheet.BottomSheetDialog
@@ -48,6 +49,7 @@ import com.jaredrummler.android.colorpicker.ColorPickerDialog
 import com.jaredrummler.android.colorpicker.ColorPickerDialogListener
 import com.lagradost.quicknovel.CommonActivity.showToast
 import com.lagradost.quicknovel.DataStore.getKey
+import com.lagradost.quicknovel.DataStore.setKey
 import com.lagradost.quicknovel.TTSNotifications.TTS_NOTIFICATION_ID
 import com.lagradost.quicknovel.databinding.ColorRoundCheckmarkBinding
 import com.lagradost.quicknovel.databinding.ReadBottomSettingsBinding
@@ -90,6 +92,10 @@ import com.lagradost.quicknovel.util.SubtitleHelper
 import com.lagradost.quicknovel.util.UIHelper.fixSystemBarsPadding
 import kotlin.collections.map
 import com.lagradost.quicknovel.util.translation.models.TranslatorAgents
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
     companion object {
@@ -102,8 +108,6 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
     }
 
     private fun hideSystemUI() {
-
-        WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, binding.readerContainer).let { controller ->
             controller.hide(WindowInsetsCompat.Type.systemBars())
             controller.systemBarsBehavior =
@@ -116,7 +120,9 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
         fun lowerBottomNav(v: View) {
             v.translationY = 0f
-            ObjectAnimator.ofFloat(v, "translationY", v.height.toFloat()).apply {
+            val params = v.layoutParams as? android.view.ViewGroup.MarginLayoutParams
+            val margin = params?.bottomMargin?.toFloat() ?: 0f
+            ObjectAnimator.ofFloat(v, "translationY", v.height.toFloat() + margin).apply {
                 duration = 200
                 start()
             }.doOnEnd {
@@ -126,11 +132,18 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
         lowerBottomNav(binding.readerBottomViewHolder)
 
+        ObjectAnimator.ofFloat(binding.readerProgressContainer, "translationY", 0f).apply {
+            duration = 250
+            start()
+        }
+
+        val topParams = binding.readToolbarHolder.layoutParams as? android.view.ViewGroup.MarginLayoutParams
+        val topMargin = topParams?.topMargin?.toFloat() ?: (12 * resources.displayMetrics.density)
         binding.readToolbarHolder.translationY = 0f
         ObjectAnimator.ofFloat(
             binding.readToolbarHolder,
             "translationY",
-            -binding.readToolbarHolder.height.toFloat()
+            -(binding.readToolbarHolder.height.toFloat() + topMargin)
         ).apply {
             duration = 200
             start()
@@ -140,7 +153,6 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
     }
 
     private fun showSystemUI() {
-        WindowCompat.setDecorFitsSystemWindows(window, true)
         WindowInsetsControllerCompat(
             window,
             binding.readerContainer
@@ -150,19 +162,33 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
 
         fun higherBottomNavView(v: View) {
             v.isVisible = true
-            v.translationY = v.height.toFloat()
-            ObjectAnimator.ofFloat(v, "translationY", 0f).apply {
-                duration = 200
-                start()
+            v.post {
+                val params = v.layoutParams as? android.view.ViewGroup.MarginLayoutParams
+                val margin = params?.bottomMargin?.toFloat() ?: 0f
+                v.translationY = v.height.toFloat() + margin
+                ObjectAnimator.ofFloat(v, "translationY", 0f).apply {
+                    duration = 250
+                    start()
+                }
+                val progressParams = binding.readerProgressContainer.layoutParams as? android.view.ViewGroup.MarginLayoutParams
+                val progressBottomMargin = progressParams?.bottomMargin?.toFloat() ?: 0f
+                val targetProgressY = -((v.height.toFloat() + margin - progressBottomMargin) + 8.toPx)
+                    .coerceAtLeast(0f)
+                ObjectAnimator.ofFloat(binding.readerProgressContainer, "translationY", targetProgressY).apply {
+                    duration = 250
+                    start()
+                }
             }
         }
 
         higherBottomNavView(binding.readerBottomViewHolder)
 
-        binding.readToolbarHolder.translationY = -binding.readToolbarHolder.height.toFloat()
+        val topParams = binding.readToolbarHolder.layoutParams as? android.view.ViewGroup.MarginLayoutParams
+        val topMargin = topParams?.topMargin?.toFloat() ?: (12 * resources.displayMetrics.density)
+        binding.readToolbarHolder.translationY = -(binding.readToolbarHolder.height.toFloat() + topMargin)
 
         ObjectAnimator.ofFloat(binding.readToolbarHolder, "translationY", 0f).apply {
-            duration = 200
+            duration = 250
             start()
         }
     }
@@ -369,27 +395,63 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
     }
 
     private var lastOverlayBottomInset: Int = 0
+    private var lastOverlayLeftInset: Int = 0
+    private var lastOverlayRightInset: Int = 0
     private var isProgressVisibleInOverlay: Boolean = false
+    private var autoScrollJob: Job? = null
+    private var isUserTouchingReader: Boolean = false
+    private var sessionStartMs: Long = 0L
+
+    private fun syncProgressBarBounds() {
+        val baseLeft = maxOf(20.toPx, lastOverlayLeftInset)
+        val baseRight = maxOf(20.toPx, lastOverlayRightInset)
+        val clockWidth = if (binding.readTimeClock.isVisible) binding.readTimeClock.width else 0
+        val batteryWidth = if (binding.readBattery.isVisible) binding.readBattery.width else 0
+        val targetLeftMargin = if (clockWidth > 0) baseLeft + clockWidth + 12.toPx else baseLeft
+        val targetRightMargin = if (batteryWidth > 0) baseRight + batteryWidth + 12.toPx else baseRight
+        val rowHeight = if (binding.readOverlay.isVisible) {
+            maxOf(binding.readOverlay.height - lastOverlayBottomInset, 25.toPx)
+        } else {
+            20.toPx
+        }
+        val targetBottomMargin = lastOverlayBottomInset + ((rowHeight - 4.toPx) / 2).coerceAtLeast(0)
+
+        val lp = binding.readerProgressContainer.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (lp.leftMargin != targetLeftMargin ||
+            lp.rightMargin != targetRightMargin ||
+            lp.bottomMargin != targetBottomMargin
+        ) {
+            lp.leftMargin = targetLeftMargin
+            lp.rightMargin = targetRightMargin
+            lp.bottomMargin = targetBottomMargin
+            binding.readerProgressContainer.layoutParams = lp
+        }
+    }
 
     private fun syncBottomReaderInset() {
-        val reservedHeight = if (binding.readOverlay.isVisible) {
+        val overlayHeight = if (binding.readOverlay.isVisible) {
             maxOf(binding.readOverlay.height, 25.toPx + lastOverlayBottomInset)
+        } else if (binding.readerProgressContainer.isVisible) {
+            20.toPx + lastOverlayBottomInset
         } else {
             lastOverlayBottomInset
         }
         val params = binding.readBottomItem.layoutParams
-        if (params != null && params.height != reservedHeight) {
-            params.height = reservedHeight
+        if (params != null && params.height != overlayHeight) {
+            params.height = overlayHeight
             binding.readBottomItem.layoutParams = params
         }
+        syncProgressBarBounds()
     }
 
     private fun updateBottomOverlayVisibility() {
         val canShowInReader = binding.readNormalLayout.isVisible
         val showTimeOrBattery = viewModel.showTime || viewModel.showBattery
-        val showProgress = canShowInReader && isProgressVisibleInOverlay
-        binding.readOverflowProgress.isVisible = showProgress
-        binding.readOverlay.isVisible = canShowInReader && (showTimeOrBattery || showProgress)
+        val showProgressPref = viewModel.showReaderProgressLive.value != false
+        val showProgress = canShowInReader && isProgressVisibleInOverlay && showProgressPref
+        binding.readOverflowProgress.isVisible = false
+        binding.readOverlay.isVisible = canShowInReader && showTimeOrBattery
+        binding.readerProgressContainer.isVisible = showProgress
         syncBottomReaderInset()
     }
 
@@ -397,8 +459,8 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         val outLocation = IntArray(2)
         binding.readBottomItem.getLocationInWindow(outLocation)
         val (_, bottomY) = outLocation
-        // readBottomItem already sits immediately above readOverlay; only fall back to
-        // subtracting readOverlay height if readBottomItem has not laid out yet.
+        // readBottomItem already sits immediately above readOverlay/readerProgressContainer;
+        // only fall back to subtracting readOverlay height if readBottomItem has not laid out yet.
         val unreservedOverlayHeight =
             if (binding.readOverlay.isVisible && binding.readBottomItem.height == 0) {
                 binding.readOverlay.height
@@ -487,51 +549,33 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             return
         }
 
-        val chapterCount = viewModel.book.size()
-        if (chapterCount <= 0) return
-        val viewportTop = getTopY()
-        val lines = getAllLines()
-        // Use the first text line crossing the reading viewport. Adapter positions are
-        // unstable because the reader keeps a moving window of chapters and paragraph
-        // rows have very different heights. Character offsets remain tied to the chapter.
-        val visibleLine = lines.firstOrNull { it.bottom > viewportTop }
-            ?: return
-        // During a chapter transition the viewport can temporarily contain only a
-        // separator/loading row. Those rows have no TextVisualLine. Do not substitute
-        // currentIndex + character 0 here: that makes the whole-book bar teleport back
-        // to the start of a chapter while RecyclerView is swapping its visible rows.
-        val chapterIndex = visibleLine.index.coerceIn(0, chapterCount - 1)
-        val chapterLength = chapterRenderedLength(chapterIndex)
+        val fill = binding.readerReadingProgressFill
+        fill.pivotX = 0f
 
-        val lineHeight = (visibleLine.bottom - visibleLine.top).coerceAtLeast(1)
-        val fractionThroughLine = (
-            (viewportTop - visibleLine.top).toFloat() / lineHeight.toFloat()
-        ).coerceIn(0f, 1f)
-        val chapterPosition = visibleLine.startChar + (
-            (visibleLine.endChar - visibleLine.startChar).coerceAtLeast(0) *
-                fractionThroughLine
-            ).roundToInt()
+        val items = textAdapter.immutableCurrentList
+        val firstVisible = textLayoutManager.findFirstVisibleItemPosition()
+        val lastVisible = textLayoutManager.findLastVisibleItemPosition()
+        val firstChild = if (firstVisible != RecyclerView.NO_POSITION) {
+            textLayoutManager.findViewByPosition(firstVisible)
+        } else null
+        val firstVisibleFraction = if (firstChild != null && firstChild.height > 0) {
+            ((-firstChild.top).toFloat() / firstChild.height.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
 
-        val canScrollDown = binding.realText.canScrollVertically(1)
-        val bottomLine = lines.lastOrNull()
-        val bottomChapterIndex = bottomLine?.index?.coerceIn(0, chapterCount - 1)
-        val bottomChapterLength = bottomChapterIndex?.let(::chapterRenderedLength) ?: 0
-        val hasLaterRenderedChapter = bottomChapterIndex != null &&
-            textAdapter.immutableCurrentList
-                .asSequence()
-                .filterIsInstance<TextSpan>()
-                .any { it.index > bottomChapterIndex }
-
-        binding.readOverflowProgress.progress = resolveEffectiveReaderProgress(
-            topChapterIndex = chapterIndex,
-            topCharacterPosition = chapterPosition,
-            topChapterLength = chapterLength,
-            bottomChapterIndex = bottomChapterIndex,
-            bottomChapterLength = bottomChapterLength,
-            chapterCount = chapterCount,
-            canScrollDown = canScrollDown,
-            hasLaterRenderedChapter = hasLaterRenderedChapter,
+        val progress = calculateNeoQnChapterProgress(
+            itemIndices = items.map { it.index },
+            currentChapterIndex = viewModel.currentIndex,
+            firstVisiblePosition = firstVisible,
+            lastVisiblePosition = lastVisible,
+            canScrollDown = binding.realText.canScrollVertically(1),
+            firstVisibleScrolledFraction = firstVisibleFraction,
         )
+        if (progress != null) {
+            fill.scaleX = progress
+            binding.readOverflowProgress.progress = (progress * 1000f).roundToInt()
+        }
         isProgressVisibleInOverlay = true
         updateBottomOverlayVisibility()
     }
@@ -700,6 +744,8 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         val trackColor = androidx.core.graphics.ColorUtils.setAlphaComponent(config.textColor, 60)
         binding.readOverflowProgress.progressTintList = ColorStateList.valueOf(indicatorColor)
         binding.readOverflowProgress.progressBackgroundTintList = ColorStateList.valueOf(trackColor)
+        binding.readerReadingProgressFill.backgroundTintList = ColorStateList.valueOf(indicatorColor)
+        binding.readerProgressContainer.setBackgroundColor(trackColor)
     }
 
     private fun updatePadding() {
@@ -740,12 +786,57 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         }
     }
 
+    private fun updateAutoScrollLoop() {
+        autoScrollJob?.cancel()
+        if (viewModel.autoScrollEnabledLive.value != true) return
+        autoScrollJob = lifecycleScope.launch {
+            var accumulator = 0f
+            val density = resources.displayMetrics.density
+            while (isActive && viewModel.autoScrollEnabledLive.value == true) {
+                delay(16L)
+                if (!isUserTouchingReader &&
+                    !viewModel.isTTSRunning() &&
+                    viewModel.bottomVisibility.value != true &&
+                    binding.readNormalLayout.isVisible
+                ) {
+                    if (!binding.realText.canScrollVertically(1)) {
+                        viewModel.autoScrollEnabledLive.postValue(false)
+                        break
+                    }
+                    val speed = viewModel.autoScrollSpeed.coerceIn(1f, 10f)
+                    accumulator += speed * density * 0.45f
+                    val step = accumulator.toInt()
+                    if (step >= 1) {
+                        accumulator -= step
+                        binding.realText.scrollBy(0, step)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun formatReadingDuration(totalMs: Long): String {
+        val totalMinutes = (totalMs / 60_000L).coerceAtLeast(0L)
+        val hours = totalMinutes / 60L
+        val minutes = totalMinutes % 60L
+        return if (hours > 0L) "${hours}h ${minutes}m" else "${minutes}m"
+    }
+
     override fun onResume() {
+        sessionStartMs = System.currentTimeMillis()
         viewModel.resumedApp()
         super.onResume()
     }
 
     override fun onPause() {
+        if (sessionStartMs > 0L) {
+            val elapsed = (System.currentTimeMillis() - sessionStartMs).coerceIn(0L, 43_200_000L)
+            sessionStartMs = 0L
+            if (elapsed > 0L) {
+                val previous = getKey<Long>(TOTAL_READING_TIME_MS, 0L) ?: 0L
+                setKey(TOTAL_READING_TIME_MS, previous + elapsed)
+            }
+        }
         viewModel.leftApp()
         super.onPause()
     }
@@ -943,6 +1034,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         CommonActivity.loadThemes(this)
         super.onCreate(savedInstanceState)
         readActivity = this
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         binding = ReadMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -962,10 +1054,12 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
             )
             lastOverlayBottomInset = bottomAndSideInsets.bottom
+            lastOverlayLeftInset = bottomAndSideInsets.left
+            lastOverlayRightInset = bottomAndSideInsets.right
             binding.readOverlay.setPadding(
-                maxOf(baseOverlayHorizontalPadding, bottomAndSideInsets.left),
+                maxOf(baseOverlayHorizontalPadding, lastOverlayLeftInset),
                 0,
-                maxOf(baseOverlayHorizontalPadding, bottomAndSideInsets.right),
+                maxOf(baseOverlayHorizontalPadding, lastOverlayRightInset),
                 lastOverlayBottomInset,
             )
             syncBottomReaderInset()
@@ -974,6 +1068,31 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         binding.readOverlay.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             syncBottomReaderInset()
         }
+
+        ViewCompat.setOnApplyWindowInsetsListener(binding.readToolbarHolder) { v, insets ->
+            val barInsets = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            val params = v.layoutParams as android.view.ViewGroup.MarginLayoutParams
+            params.topMargin = barInsets.top + 12.toPx
+            params.leftMargin = 16.toPx + barInsets.left
+            params.rightMargin = 16.toPx + barInsets.right
+            v.layoutParams = params
+            insets
+        }
+
+        ViewCompat.setOnApplyWindowInsetsListener(binding.readerBottomViewHolder) { v, insets ->
+            val barInsets = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            val params = v.layoutParams as android.view.ViewGroup.MarginLayoutParams
+            params.bottomMargin = 24.toPx + barInsets.bottom
+            params.leftMargin = 24.toPx + barInsets.left
+            params.rightMargin = 24.toPx + barInsets.right
+            v.layoutParams = params
+            insets
+        }
+
         ViewCompat.requestApplyInsets(binding.root)
 
         binding.readOverflowProgress.apply {
@@ -982,16 +1101,13 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             max = 1000
             progress = 0
         }
-        fixSystemBarsPadding(binding.readerBottomViewHolder, padTop = false, overlayCutout = false)
-        fixSystemBarsPadding(binding.readToolbarHolder, padBottom = false, overlayCutout = false)
 
         registerBattery()
 
         // Reader loading is started after all views, adapters, layout managers and
         // observers have been installed. Previously a very fast cached chapter could
         // finish while onCreate was still assembling the RecyclerView.
-        topBarHeight = binding.readToolbarHolder.minimumHeight + getStatusBarHeight()
-        binding.readToolbarHolder.minimumHeight = topBarHeight
+        topBarHeight = 64.toPx + getStatusBarHeight() + 12.toPx
         textAdapter = TextAdapter(
             viewModel,
             TextConfig(
@@ -1034,9 +1150,6 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                 this@ReadActivity2.onBackPressed()
             }
         }
-
-        //updateTimeText()
-        fixPaddingStatusbar(binding.readToolbarHolder)
 
         observe(viewModel.paddingHorizontalLive) {
             updatePadding()
@@ -1085,6 +1198,26 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         observe(viewModel.showTimeLive) { show ->
             binding.readTimeClock.isVisible = show
             updateBottomOverlayVisibility()
+        }
+
+        observe(viewModel.showReaderProgressLive) {
+            updateBottomOverlayVisibility()
+        }
+
+        observe(viewModel.autoScrollEnabledLive) {
+            updateAutoScrollLoop()
+        }
+
+        observe(viewModel.isTranslationActiveLive) { active ->
+            binding.readTranslateToggle.isVisible = active == true
+        }
+
+        observe(viewModel.isShowingOriginalLive) { isOriginal ->
+            binding.readTranslateToggle.alpha = if (isOriginal == true) 0.55f else 1.0f
+        }
+
+        binding.readTranslateToggle.setOnClickListener {
+            viewModel.toggleShowOriginal()
         }
 
         observe(viewModel.screenAwakeLive) { awake ->
@@ -1319,7 +1452,11 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
             // testing overscroll
             setOnTouchListener { _, event ->
                 when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        isUserTouchingReader = true
+                    }
                     MotionEvent.ACTION_MOVE -> {
+                        isUserTouchingReader = true
                         if (event.historySize <= 1) return@setOnTouchListener false
                         val start = event.getHistoricalY(0, event.historySize - 1)
                         val end = event.getY(0)
@@ -1347,7 +1484,8 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                         return@setOnTouchListener false
                     }
 
-                    MotionEvent.ACTION_UP -> {
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        isUserTouchingReader = false
                         currentOverScroll = 0.0f
                     }
 
@@ -1896,10 +2034,40 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                     viewModel.showBattery = isChecked
                 }
 
+                readSettingsShowProgress.isChecked = viewModel.showReaderProgress
+                readSettingsShowProgress.setOnCheckedChangeListener { _, isChecked ->
+                    viewModel.showReaderProgress = isChecked
+                }
+
                 readSettingsKeepScreenActive.isChecked = viewModel.screenAwake
                 readSettingsKeepScreenActive.setOnCheckedChangeListener { _, isChecked ->
                     viewModel.screenAwake = isChecked
                 }
+
+                readSettingsAutoScroll.isChecked = viewModel.autoScrollEnabledLive.value == true
+                readSettingsAutoScroll.setOnCheckedChangeListener { _, isChecked ->
+                    viewModel.autoScrollEnabledLive.postValue(isChecked)
+                    if (isChecked) {
+                        bottomSheetDialog.dismiss()
+                        if (viewModel.bottomVisibility.value == true) {
+                            viewModel.switchVisibility()
+                        }
+                    }
+                }
+
+                readSettingsAutoScrollSpeed.apply {
+                    setValueRounded(viewModel.autoScrollSpeed)
+                    addOnChangeListener { _, value, _ ->
+                        viewModel.autoScrollSpeed = value
+                    }
+                }
+
+                val savedTime = getKey<Long>(TOTAL_READING_TIME_MS, 0L) ?: 0L
+                val activeTime = if (sessionStartMs > 0L) {
+                    (System.currentTimeMillis() - sessionStartMs).coerceIn(0L, 43_200_000L)
+                } else 0L
+                readSettingsReadingTime.text =
+                    getString(R.string.reading_timer_format, formatReadingDuration(savedTime + activeTime))
 
             }
 

@@ -151,40 +151,41 @@ class ReaderActivitySmokeTest {
                 var progressVisible = false
                 scenario.onActivity { activity ->
                     val recycler = activity.findViewById<RecyclerView>(R.id.real_text)
-                    val progress = activity.findViewById<ProgressBar>(R.id.read_overflow_progress)
-                    progressVisible = progress?.visibility == View.VISIBLE
+                    val progressContainer = activity.findViewById<View>(R.id.reader_progress_container)
+                    progressVisible = progressContainer?.visibility == View.VISIBLE
                     val lastPosition = (recycler.adapter?.itemCount ?: 1) - 1
                     if (lastPosition >= 0) recycler.scrollToPosition(lastPosition)
                     recycler.scrollBy(0, 100_000)
                 }
                 SystemClock.sleep(500)
                 InstrumentationRegistry.getInstrumentation().waitForIdleSync()
-                var progressAfterScroll = 0
+                var progressAfterScroll = 0f
                 var progressInBottomOverlay = false
                 var textAboveBottomOverlay = false
                 scenario.onActivity { activity ->
                     val recycler = activity.findViewById<RecyclerView>(R.id.real_text)
-                    val progress = activity.findViewById<ProgressBar>(R.id.read_overflow_progress)
+                    val progressContainer = activity.findViewById<View>(R.id.reader_progress_container)
+                    val progressFill = activity.findViewById<View>(R.id.reader_reading_progress_fill)
                     val overlay = activity.findViewById<View>(R.id.read_overlay)
                     val timeClock = activity.findViewById<View>(R.id.read_time_clock)
                     val battery = activity.findViewById<View>(R.id.read_battery)
                     val root = activity.findViewById<View>(R.id.reader_container)
-                    progressAfterScroll = progress?.progress ?: 0
+                    progressAfterScroll = progressFill?.scaleX ?: 0f
                     val overlayLoc = IntArray(2)
                     val progressLoc = IntArray(2)
                     val timeLoc = IntArray(2)
                     val batteryLoc = IntArray(2)
                     val recyclerLoc = IntArray(2)
-                    if (progress != null && overlay != null && root != null && recycler != null) {
+                    if (progressContainer != null && overlay != null && root != null && recycler != null) {
                         overlay.getLocationInWindow(overlayLoc)
-                        progress.getLocationInWindow(progressLoc)
+                        progressContainer.getLocationInWindow(progressLoc)
                         recycler.getLocationInWindow(recyclerLoc)
                         val overlayTop = overlayLoc[1]
                         val overlayBottom = overlayTop + overlay.height
                         val progressLeft = progressLoc[0]
-                        val progressRight = progressLeft + progress.width
+                        val progressRight = progressLeft + progressContainer.width
                         val progressTop = progressLoc[1]
-                        val progressBottom = progressTop + progress.height
+                        val progressBottom = progressTop + progressContainer.height
                         val horizontallyOrdered =
                             (timeClock == null || timeClock.visibility != View.VISIBLE || run {
                                 timeClock.getLocationInWindow(timeLoc)
@@ -197,7 +198,7 @@ class ReaderActivitySmokeTest {
                         progressInBottomOverlay = overlay.top >= root.height * 0.75f &&
                             progressTop >= overlayTop &&
                             progressBottom <= overlayBottom &&
-                            progress.width > 0 &&
+                            progressContainer.width > 0 &&
                             horizontallyOrdered
                         textAboveBottomOverlay = recyclerLoc[1] + recycler.height <= overlayTop + 1
                     }
@@ -207,8 +208,8 @@ class ReaderActivitySmokeTest {
                     progressVisible,
                 )
                 assertTrue(
-                    "Reader progress did not advance after scrolling (progress=$progressAfterScroll)",
-                    progressAfterScroll > 0,
+                    "Reader progress did not advance after scrolling (scaleX=$progressAfterScroll)",
+                    progressAfterScroll > 0f,
                 )
                 assertTrue(
                     "Reader progress bar is not centered horizontally inside the bottom time/battery row",

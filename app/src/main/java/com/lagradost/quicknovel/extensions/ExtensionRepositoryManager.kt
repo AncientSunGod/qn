@@ -65,12 +65,14 @@ data class InstalledExtension(
 )
 
 object ExtensionRepositoryManager {
+    const val OFFICIAL_LNREADER_REPO_URL =
+        "https://raw.githubusercontent.com/LNReader/lnreader-plugins/plugins/v3.0.0/.dist/plugins.min.json"
     private const val PREFS = "extension_repository_manager"
     private const val REPOSITORIES_KEY = "repository_urls"
     private const val EXTENSIONS_DIR = "extensions"
     private const val MAX_BUNDLE_BYTES = 8 * 1024 * 1024
     private const val MAX_CUSTOM_ASSET_BYTES = 512 * 1024
-    private const val MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+    private const val MAX_MANIFEST_BYTES = 6 * 1024 * 1024
     private val extensionIdPattern = Regex("[A-Za-z0-9._-]{1,120}")
 
     @Volatile
@@ -84,8 +86,21 @@ object ExtensionRepositoryManager {
             .toList()
             .sorted()
 
+    fun normalizeManifestUrlInput(rawUrl: String): String {
+        val trimmed = rawUrl.trim()
+        if (trimmed.equals("https://github.com/LNReader/lnreader-plugins", ignoreCase = true) ||
+            trimmed.equals("https://github.com/LNReader/lnreader-plugins/", ignoreCase = true)
+        ) {
+            return OFFICIAL_LNREADER_REPO_URL
+        }
+        if (trimmed.endsWith("/.dist", ignoreCase = true) || trimmed.endsWith("/.dist/", ignoreCase = true)) {
+            return trimmed.trimEnd('/') + "/plugins.min.json"
+        }
+        return trimmed
+    }
+
     fun addRepository(context: Context, rawUrl: String): Result<List<String>> {
-        val url = rawUrl.trim()
+        val url = normalizeManifestUrlInput(rawUrl)
         if (!isValidManifestUrl(url)) {
             return Result.failure(IllegalArgumentException(
                 "Enter a repository manifest URL ending in plugins.min.json."

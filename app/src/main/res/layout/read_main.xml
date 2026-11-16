@@ -276,13 +276,16 @@
                     android:id="@+id/read_overflow_progress"
                     style="@style/Widget.AppCompat.ProgressBar.Horizontal"
                     android:layout_width="0dp"
-                    android:layout_weight="1"
-                    android:layout_height="4dp"
-                    android:layout_gravity="center_vertical"
+                    android:layout_height="0dp"
                     android:visibility="gone"
                     android:indeterminate="false"
                     android:max="1000"
                     android:progress="0" />
+
+            <Space
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
 
             <TextView
                     tools:text="85%"
@@ -310,11 +313,32 @@
                     tools:ignore="SmallSp" />
         </LinearLayout>
 
+        <FrameLayout
+                android:id="@+id/reader_progress_container"
+                android:layout_width="match_parent"
+                android:layout_height="4dp"
+                android:layout_gravity="bottom"
+                android:layout_marginStart="20dp"
+                android:layout_marginEnd="20dp"
+                android:layout_marginBottom="10dp"
+                android:background="#26808080"
+                android:visibility="gone"
+                tools:visibility="visible">
 
-
+            <View
+                    android:id="@+id/reader_reading_progress_fill"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:alpha="0.9"
+                    android:background="?attr/colorAccent"
+                    android:scaleX="0"
+                    android:transformPivotX="0dp" />
+        </FrameLayout>
 
         <LinearLayout
-                android:background="?attr/primaryGrayBackground"
+                android:background="@drawable/spatial_glass_card"
+                android:elevation="8dp"
+                android:outlineProvider="background"
                 android:orientation="vertical"
                 android:visibility="gone"
                 tools:visibility="visible"
@@ -322,6 +346,9 @@
                 android:layout_gravity="bottom"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginStart="24dp"
+                android:layout_marginEnd="24dp"
+                android:layout_marginBottom="24dp"
                 tools:ignore="UselessParent">
 
             <TextView
@@ -466,24 +493,40 @@
                 tools:visibility="visible"
                 android:minHeight="?attr/actionBarSize"
                 android:layout_width="match_parent"
+                android:layout_height="64dp"
+                android:layout_marginHorizontal="16dp"
+                android:layout_marginTop="12dp"
                 android:id="@+id/read_toolbar_holder"
-                android:background="?attr/primaryGrayBackground"
-                android:layout_height="wrap_content">
+                android:background="@drawable/spatial_glass_card"
+                android:elevation="10dp"
+                android:outlineProvider="background"
+                app:elevation="0dp">
 
             <com.google.android.material.appbar.MaterialToolbar
                     android:id="@+id/read_toolbar"
-
                     android:layout_gravity="center"
                     android:gravity="center"
-
                     app:navigationIconTint="?attr/iconColor"
                     app:titleTextColor="?attr/textColor"
                     app:subtitleTextColor="?attr/grayTextColor"
                     tools:title="TEST"
                     tools:subtitle="TEST"
-
                     android:layout_width="match_parent"
-                    android:layout_height="match_parent" />
+                    android:layout_height="match_parent">
+
+                <ImageButton
+                        android:id="@+id/read_translate_toggle"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
+                        android:layout_gravity="end|center_vertical"
+                        android:layout_marginEnd="12dp"
+                        android:background="?selectableItemBackgroundBorderless"
+                        android:contentDescription="@string/a11y_translate_toggle"
+                        android:src="@drawable/translate_24px"
+                        android:visibility="gone"
+                        app:tint="?attr/textColor"
+                        tools:visibility="visible" />
+            </com.google.android.material.appbar.MaterialToolbar>
         </com.google.android.material.appbar.AppBarLayout>
     </FrameLayout>
 

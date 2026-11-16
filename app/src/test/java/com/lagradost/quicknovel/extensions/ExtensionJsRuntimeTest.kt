@@ -1123,4 +1123,171 @@ class ExtensionJsRuntimeTest {
         }
     }
 
+    @Test
+    fun supportsBase64BufferTextEncodingAbortControllerIntlAndEs2020Globals() {
+        val (extension, file) = extension(
+            "module.exports = { searchNovels: function() { " +
+                "var b64 = btoa('QuickNovel'); " +
+                "var decoded = atob(b64); " +
+                "var buf = Buffer.from('Hello', 'utf8'); " +
+                "var bytes = new TextEncoder().encode('Hi!'); " +
+                "var txt = new TextDecoder().decode(bytes); " +
+                "var ac = new AbortController(); ac.abort(); " +
+                "var dtf = new Intl.DateTimeFormat('en-US'); " +
+                "var replaced = 'a-b-c'.replaceAll('-', '_'); " +
+                "var matches = Array.from('a1b2'.matchAll(/\\d/g)).map(function(m){return m[0];}).join(''); " +
+                "var flat = [[1,[2]],3].flat(2).at(-1); " +
+                "return [{decoded:decoded,hex:buf.toString('hex'),b64Buf:buf.toString('base64'),txt:txt," +
+                "aborted:ac.signal.aborted,dtfOk:typeof dtf.format(new Date(0))==='string'," +
+                "replaced:replaced,matches:matches,flat:flat,hasGlobal:globalThis===this}]; } };"
+        )
+        try {
+            val result = ExtensionJsRuntime.execute(extension, "searchNovels", "[]").getOrThrow()
+            val item = JSONArray(result.json).getJSONObject(0)
+            assertEquals("QuickNovel", item.getString("decoded"))
+            assertEquals("48656c6c6f", item.getString("hex"))
+            assertEquals("SGVsbG8=", item.getString("b64Buf"))
+            assertEquals("Hi!", item.getString("txt"))
+            assertEquals(true, item.getBoolean("aborted"))
+            assertEquals(true, item.getBoolean("dtfOk"))
+            assertEquals("a_b_c", item.getString("replaced"))
+            assertEquals("12", item.getString("matches"))
+            assertEquals(3, item.getInt("flat"))
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun supportsHeadRequestsUrlSearchParamsPostAndBinaryArrayBufferFetch() {
+        val (extension, file) = extension(
+            "var fetchApi = require('@libs/fetch').fetchApi; " +
+                "module.exports = { searchNovels: function() { " +
+                "var headP = fetchApi('https://example.com/ping', {method:'HEAD'}).then(function(r){return r.status;}); " +
+                "var params = new URLSearchParams({q:'hello world',page:2}); " +
+                "var formP = fetchApi('https://example.com/form', {method:'POST',body:params}).then(function(r){return r.text();}); " +
+                "var binP = fetchApi('https://example.com/bin', {method:'POST',body:new Uint8Array([1,2,3,4])})" +
+                ".then(function(r){return r.arrayBuffer();}).then(function(buf){return new Uint8Array(buf).length;}); " +
+                "return Promise.all([headP, formP, binP]).then(function(res){return [{head:res[0],form:res[1],binLen:res[2]}];}); } };"
+        )
+        try {
+            val result = ExtensionJsRuntime.execute(
+                extension = extension,
+                operation = "searchNovels",
+                argumentsJson = "[]",
+                testRequestOverride = { url, method, headers, body ->
+                    when (url) {
+                        "https://example.com/ping" -> {
+                            assertEquals("HEAD", method)
+                            ExtensionHttpClient.TextResponse(url, 204, "text/plain", "")
+                        }
+                        "https://example.com/form" -> {
+                            assertEquals("POST", method)
+                            assertEquals("application/x-www-form-urlencoded;charset=UTF-8", headers["Content-Type"])
+                            assertEquals("q=hello+world&page=2", body)
+                            ExtensionHttpClient.TextResponse(url, 200, "text/plain", "form-ok")
+                        }
+                        "https://example.com/bin" -> {
+                            assertEquals("POST", method)
+                            ExtensionHttpClient.TextResponse(
+                                url, 200, "application/octet-stream", "",
+                                bodyBytes = byteArrayOf(9, 8, 7, 6, 5),
+                            )
+                        }
+                        else -> throw AssertionError("Unexpected URL: $url")
+                    }
+                },
+            ).getOrThrow()
+            val item = JSONArray(result.json).getJSONObject(0)
+            assertEquals(204, item.getInt("head"))
+            assertEquals("form-ok", item.getString("form"))
+            assertEquals(5, item.getInt("binLen"))
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun supportsExtendedCheerioTraversalMutationAndXmlMode() {
+        val (extension, file) = extension(
+            "var cheerio = require('cheerio'); " +
+                "module.exports = { searchNovels: function() { " +
+                "var $ = cheerio.load('<section class=\"wrap\"><div id=\"a\" data-info=\"42\"><h2 class=\"t\">Title<span>(Extra)</span></h2><p class=\"p1\">One</p><p class=\"p2\">Two</p><p class=\"p3\">Three</p></div></section>'); " +
+                "var cleanTitle = $('h2.t').clone().children().remove().end().text().trim(); " +
+                "var clonedTreeCount = $('.p1').parents('section').length; " +
+                "var closestId = $('.p2').closest('div').attr('id'); " +
+                "var isP2 = $('.p2').is('.p2'); " +
+                "var notCount = $('#a p').not('.p2').length; " +
+                "var slicedText = $('#a p').slice(1, 3).map(function(){return $(this).text();}).get().join(','); " +
+                "var nextAllCount = $('.p1').nextAll('p').length; " +
+                "var prevAllCount = $('.p3').prevAll('p').length; " +
+                "var siblingsCount = $('.p2').siblings('p').length; " +
+                "var dataVal = $('#a').data('info'); " +
+                "$('.p1').addClass('active').removeClass('p1').html('<em>Updated</em>'); " +
+                "var createdText = $('<span>Fresh</span>').text(); " +
+                "var xml$ = cheerio.load('<feed><entry><title>XML Item</title></entry></feed>', {xmlMode:true}); " +
+                "return [{cleanTitle:cleanTitle,parents:clonedTreeCount,closestId:closestId,isP2:isP2," +
+                "notCount:notCount,slicedText:slicedText,nextAllCount:nextAllCount,prevAllCount:prevAllCount," +
+                "siblingsCount:siblingsCount,dataVal:dataVal,hasActive:$('.p1').length===0 && $('.active').length===1," +
+                "outer:$.html('.active'),createdText:createdText,xmlTitle:xml$('entry > title').text()}]; } };"
+        )
+        try {
+            val result = ExtensionJsRuntime.execute(extension, "searchNovels", "[]").getOrThrow()
+            val item = JSONArray(result.json).getJSONObject(0)
+            assertEquals("Title", item.getString("cleanTitle"))
+            assertEquals(1, item.getInt("parents"))
+            assertEquals("a", item.getString("closestId"))
+            assertEquals(true, item.getBoolean("isP2"))
+            assertEquals(2, item.getInt("notCount"))
+            assertEquals("Two,Three", item.getString("slicedText"))
+            assertEquals(2, item.getInt("nextAllCount"))
+            assertEquals(2, item.getInt("prevAllCount"))
+            assertEquals(2, item.getInt("siblingsCount"))
+            assertEquals("42", item.getString("dataVal"))
+            assertEquals(true, item.getBoolean("hasActive"))
+            assertTrue(item.getString("outer").contains("<em>Updated</em>"))
+            assertEquals("Fresh", item.getString("createdText"))
+            assertEquals("XML Item", item.getString("xmlTitle"))
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun supportsHtmlparser2OnAttributeOnOpenTagNameOnEndAndDayjsFormats() {
+        val (extension, file) = extension(
+            "var Parser = require('htmlparser2').Parser; " +
+                "var dayjs = require('dayjs'); " +
+                "dayjs.extend(function(){}); " +
+                "module.exports = { searchNovels: function() { " +
+                "var seenTags = [], seenAttrs = [], ended = false; " +
+                "var parser = new Parser({" +
+                "onopentagname:function(n){seenTags.push(n);}," +
+                "onattribute:function(k,v){seenAttrs.push(k+'='+v);}," +
+                "onend:function(){ended=true;}" +
+                "}); parser.write('<div data-id=\"7\">Hello</div>'); parser.end(); " +
+                "localStorage.setItem('gkey','gval'); " +
+                "var d1 = dayjs('14/08/2026', 'DD/MM/YYYY').format('YYYY-MM-DD'); " +
+                "var d2 = dayjs('08/14/2026', 'MM/DD/YYYY').format('YYYY-MM-DD'); " +
+                "var rel = dayjs('3 days ago'); " +
+                "return [{tags:seenTags.join(','),attrs:seenAttrs.join(','),ended:ended," +
+                "gval:localStorage.getItem('gkey'),d1:d1,d2:d2,relValid:rel.isValid(),fn:dayjs().fromNow()}]; } };"
+        )
+        try {
+            val result = ExtensionJsRuntime.execute(extension, "searchNovels", "[]").getOrThrow()
+            val item = JSONArray(result.json).getJSONObject(0)
+            assertTrue(item.getString("tags").contains("div"))
+            assertTrue(item.getString("attrs").contains("data-id=7"))
+            assertEquals(true, item.getBoolean("ended"))
+            assertEquals("gval", item.getString("gval"))
+            assertEquals("2026-08-14", item.getString("d1"))
+            assertEquals("2026-08-14", item.getString("d2"))
+            assertEquals(true, item.getBoolean("relValid"))
+            assertTrue(item.getString("fn").isNotEmpty())
+        } finally {
+            ExtensionJsRuntime.clearSessionStorage(extension.id)
+            file.delete()
+        }
+    }
+
 }
