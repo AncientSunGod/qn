@@ -1,7 +1,7 @@
 # https://docs.gradle.org/current/userguide/plugins.html#sec:version_catalog_plugin_application
 # https://docs.gradle.org/current/userguide/dependency_versions.html#sec:strict-version
 [versions]
-androidGradlePlugin = "9.1.0"
+androidGradlePlugin = "9.5.1"
 coilComposeVersion = "3.5.0"
 kotlinGradlePlugin = "2.4.10"
 kover = "0.9.11"
