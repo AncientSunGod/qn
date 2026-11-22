@@ -6,7 +6,7 @@ import com.lagradost.quicknovel.util.AppUtils.parseJson
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
-class RanobesProvider : MainAPI() {
+object RanobesProvider : MainAPI() {
     override val name = "Ranobes"
     override val mainUrl = "https://ranobes.net"
     override val hasMainPage = true
@@ -61,8 +61,9 @@ class RanobesProvider : MainAPI() {
     override suspend fun loadMainPage(
         page: Int, mainCategory: String?, orderBy: String?, tag: String?
     ): HeadMainPageResponse {
-        val url = if (page <= 1) "$mainUrl/tags/genre/$tag/"
-        else "$mainUrl/tags/genre/$tag/page/$page/"
+        val safeTag = tag?.takeIf { it.isNotBlank() } ?: "Action"
+        val url = if (page <= 1) "$mainUrl/tags/genre/$safeTag/"
+        else "$mainUrl/tags/genre/$safeTag/page/$page/"
 
         val document = app.get(url, headers = baseHeaders).document
 
@@ -141,11 +142,13 @@ class RanobesProvider : MainAPI() {
                 it.text()
             }
             try {
-                rating = (document.selectFirst("#rate_b > div > div > div > span.bold")?.text()
-                    ?.substringBefore("/")?.toFloatOrNull()?.times(200))?.toInt()!!
+                score = Score.from5(
+                    document.selectFirst("#rate_b > div > div > div > span.bold")?.text()
+                        ?.substringBefore("/")
+                )
 
-                peopleVoted = document.selectFirst("div.rate-stat-num > span.small.grey")?.text()!!
-                    .filter { it.isDigit() }.toInt()
+                peopleVoted = document.selectFirst("div.rate-stat-num > span.small.grey")?.text()
+                    ?.filter { it.isDigit() }?.toIntOrNull()
             } catch (_: Throwable) {
             }
             synopsis = document.selectFirst("div.moreless")?.text()
@@ -229,8 +232,8 @@ class RanobesProvider : MainAPI() {
         arguments: List<String>,
         itemsPerPage: Int
     ): Pair<Int, Int> {
-        val chapterBigIndex = arguments[1].toInt()
-        val totalChapters = arguments[2].toInt()
+        val chapterBigIndex = arguments.getOrNull(1)?.toIntOrNull() ?: return 1 to 0
+        val totalChapters = arguments.getOrNull(2)?.toIntOrNull()?.takeIf { it > 0 } ?: return 1 to 0
         val totalPages = (totalChapters + itemsPerPage - 1) / itemsPerPage
 
         val page = (totalChapters - 1 - chapterBigIndex) / itemsPerPage + 1

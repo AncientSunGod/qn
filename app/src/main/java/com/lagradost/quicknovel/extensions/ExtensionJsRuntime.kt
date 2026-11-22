@@ -1,6 +1,11 @@
 package com.lagradost.quicknovel.extensions
 
 import android.content.Context as AndroidContext
+import com.lagradost.quicknovel.network.CloudflareChallengeException
+import com.lagradost.quicknovel.network.WebViewResolver
+import com.lagradost.quicknovel.network.isCloudflareChallengeResponse
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -18,6 +23,8 @@ import org.mozilla.javascript.Scriptable
 import org.mozilla.javascript.ScriptableObject
 import java.io.File
 import java.net.URI
+import java.util.Collections
+import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -33,6 +40,11 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object ExtensionJsRuntime {
     private val sessionStorage = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
+    private val staticAssetCache: MutableMap<String, ExtensionHttpClient.TextResponse> =
+        Collections.synchronizedMap(object : LinkedHashMap<String, ExtensionHttpClient.TextResponse>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ExtensionHttpClient.TextResponse>?): Boolean =
+                size > 64
+        })
 
     internal fun clearSessionStorage(extensionId: String) {
         sessionStorage.remove(extensionId)
@@ -40,6 +52,7 @@ object ExtensionJsRuntime {
 
     internal fun clearExtensionData(context: AndroidContext, extensionId: String) {
         clearSessionStorage(extensionId)
+        staticAssetCache.clear()
         context.getSharedPreferences(
             "quicknovel_extension_storage_$extensionId",
             AndroidContext.MODE_PRIVATE,
@@ -98,6 +111,7 @@ object ExtensionJsRuntime {
         storageContext: AndroidContext? = null,
         testRequestOverride: ((String, String, Map<String, String>, String?) -> ExtensionHttpClient.TextResponse)? = null,
         customScript: String? = null,
+        testWebviewOverride: ((String, String?, Long, Long) -> String?)? = null,
     ): Result<ExecutionResult> = runCatching {
         require(operation in allowedOperations) { "Unsupported extension operation." }
         if (operation == "transformChapterHtml") {
@@ -149,7 +163,7 @@ object ExtensionJsRuntime {
                     args: Array<out Any>,
                 ): Any {
                     fetchCount += 1
-                    val requestLimit = if (operation == "parseNovel") 80 else 20
+                    val requestLimit = if (operation == "parseNovel" || operation == "parseChapter") 100 else 30
                     require(fetchCount <= requestLimit) {
                         "Extension exceeded the $requestLimit-request operation limit during $operation."
                     }
@@ -193,17 +207,37 @@ object ExtensionJsRuntime {
                     require((requestBody?.toByteArray(Charsets.UTF_8)?.size ?: requestBodyBytes?.size ?: 0) <= 256 * 1024) {
                         "Extension request body exceeds the 256 KB limit."
                     }
-                    val response = testRequestOverride?.invoke(
-                        requestedUrl, method, requestHeaders, requestBody
-                    ) ?: testFetchOverride?.invoke(requestedUrl) ?: ExtensionHttpClient.requestText(
-                        rawUrl = requestedUrl,
-                        method = method,
-                        body = requestBody,
-                        headers = requestHeaders,
-                        allowedHosts = approvedHosts,
-                        responseEncoding = responseEncoding,
-                        bodyBytes = requestBodyBytes,
-                    ).getOrThrow()
+                    val normalizedCacheUrl = if (
+                        testRequestOverride == null &&
+                        testFetchOverride == null &&
+                        method == "GET" &&
+                        !binaryBase64 &&
+                        requestBody == null &&
+                        requestBodyBytes == null &&
+                        isCacheableStaticAssetUrl(requestedUrl)
+                    ) {
+                        normalizeStaticAssetCacheKey(requestedUrl)
+                    } else null
+                    val response = normalizedCacheUrl?.let { staticAssetCache[it] } ?: (
+                        testRequestOverride?.invoke(
+                            requestedUrl, method, requestHeaders, requestBody
+                        ) ?: testFetchOverride?.invoke(requestedUrl) ?: ExtensionHttpClient.requestText(
+                            rawUrl = requestedUrl,
+                            method = method,
+                            body = requestBody,
+                            headers = requestHeaders,
+                            allowedHosts = approvedHosts,
+                            responseEncoding = responseEncoding,
+                            bodyBytes = requestBodyBytes,
+                        ).getOrThrow()
+                    ).also { fetched ->
+                        if (normalizedCacheUrl != null &&
+                            fetched.statusCode in 200..299 &&
+                            fetched.body.length <= 2 * 1024 * 1024
+                        ) {
+                            staticAssetCache[normalizedCacheUrl] = fetched
+                        }
+                    }
                     val responseJson = JSONObject()
                         .put("url", response.url)
                         .put("statusCode", response.statusCode)
@@ -235,6 +269,112 @@ object ExtensionJsRuntime {
             fetchFunction.parentScope = scope
             fetchFunction.prototype = ScriptableObject.getFunctionPrototype(scope)
             ScriptableObject.putProperty(scope, "__qnFetch", fetchFunction)
+            var webviewFetchCount = 0
+            val fetchViaWebviewFunction = object : BaseFunction() {
+                override fun call(
+                    context: Context,
+                    callScope: Scriptable,
+                    thisObj: Scriptable,
+                    args: Array<out Any>,
+                ): Any {
+                    val requestedUrl = args.firstOrNull()?.toString().orEmpty()
+                    val (targetHost, waitForSelector, timeoutMs, settleMs) = try {
+                        webviewFetchCount += 1
+                        require(webviewFetchCount <= 10) {
+                            "Extension exceeded the 10-WebView request limit during $operation."
+                        }
+                        require(requestedUrl.isNotBlank()) { "WebView fetch URL is missing." }
+                        val parsedUri = runCatching { URI(requestedUrl) }.getOrNull()
+                            ?: throw IllegalArgumentException("Invalid WebView fetch URL.")
+                        require(parsedUri.scheme.equals("https", true) || parsedUri.scheme.equals("http", true)) {
+                            "WebView requests must use HTTP or HTTPS."
+                        }
+                        val resolvedHost = parsedUri.host?.lowercase(Locale.ROOT)
+                            ?: throw IllegalArgumentException("WebView fetch URL has no host.")
+                        require(ExtensionHttpClient.isHostApproved(resolvedHost, approvedHosts)) {
+                            "WebView request host is outside the approved extension site."
+                        }
+                        val options = runCatching {
+                            JSONObject(args.getOrNull(1)?.toString().orEmpty())
+                        }.getOrDefault(JSONObject())
+                        val selector = options.optString("waitForSelector", "")
+                            .takeIf { it.isNotBlank() && it != "null" && it != "undefined" }
+                        val timeout = options.optLong("timeoutMs", 15_000L).coerceIn(1_000L, 60_000L)
+                        val settle = options.optLong("settleMs", 400L).coerceIn(0L, 10_000L)
+                        listOf(resolvedHost, selector, timeout, settle)
+                    } catch (error: IllegalArgumentException) {
+                        return JSONObject()
+                            .put("ok", false)
+                            .put("url", requestedUrl)
+                            .put("html", "")
+                            .put("error", error.message ?: "WebView request rejected.")
+                            .toString()
+                    }
+                    val resolvedHost = targetHost as String
+                    val resolvedSelector = waitForSelector as String?
+                    val resolvedTimeoutMs = timeoutMs as Long
+                    val resolvedSettleMs = settleMs as Long
+
+                    val html = if (testWebviewOverride != null) {
+                        testWebviewOverride.invoke(requestedUrl, resolvedSelector, resolvedTimeoutMs, resolvedSettleMs)
+                    } else {
+                        val selectorLiteral = resolvedSelector?.let { JSONObject.quote(it) } ?: "null"
+                        val waitScript = """
+                            (function() {
+                              var selector = $selectorLiteral;
+                              var settle = $resolvedSettleMs;
+                              var deadline = Date.now() + $resolvedTimeoutMs;
+                              function poll() {
+                                var matched = !selector || document.querySelector(selector) !== null;
+                                if (matched || Date.now() >= deadline) {
+                                  setTimeout(function() {
+                                    var html = document.documentElement ? document.documentElement.outerHTML : '';
+                                    if (typeof NativeAndroid !== 'undefined' && NativeAndroid.onElementFound) {
+                                      NativeAndroid.onElementFound(html);
+                                    }
+                                  }, settle);
+                                } else {
+                                  setTimeout(poll, 150);
+                                }
+                              }
+                              poll();
+                            })();
+                        """.trimIndent()
+                        runBlocking {
+                            withTimeoutOrNull(resolvedTimeoutMs + 2_000L) {
+                                WebViewResolver(scriptToFinish = waitScript).resolveUsingWebView(
+                                    com.lagradost.nicehttp.requestCreator("GET", requestedUrl)
+                                ).first as? String
+                            }
+                        }
+                    }
+
+                    if (!html.isNullOrBlank() && isCloudflareChallengeResponse(
+                            statusCode = 403,
+                            cfRay = null,
+                            server = null,
+                            cfMitigated = null,
+                            location = null,
+                            bodySample = html.take(8192),
+                        )
+                    ) {
+                        throw CloudflareChallengeException(
+                            url = requestedUrl,
+                            host = resolvedHost,
+                            message = "Cloudflare verification required for $resolvedHost. Tap 'Open verification' to continue.",
+                        )
+                    }
+
+                    return JSONObject()
+                        .put("ok", !html.isNullOrBlank())
+                        .put("url", requestedUrl)
+                        .put("html", html.orEmpty())
+                        .toString()
+                }
+            }
+            fetchViaWebviewFunction.parentScope = scope
+            fetchViaWebviewFunction.prototype = ScriptableObject.getFunctionPrototype(scope)
+            ScriptableObject.putProperty(scope, "__qnFetchViaWebview", fetchViaWebviewFunction)
             var accumulatedTimerDelayMs = 0L
             val timerDelayFunction = object : BaseFunction() {
                 override fun call(
@@ -328,7 +468,9 @@ object ExtensionJsRuntime {
                     // storage in the same per-extension in-memory area rather than failing
                     // during module initialization; production providers pass app context.
                     val sessionValues = if (area == "session" || storageContext == null) {
-                        sessionStorage.computeIfAbsent(extension.id) { ConcurrentHashMap() }
+                        synchronized(sessionStorage) {
+                            sessionStorage.getOrPut(extension.id) { ConcurrentHashMap() }
+                        }
                     } else null
                     val prefs = if (sessionValues == null) {
                         storageContext?.getSharedPreferences(
@@ -453,6 +595,52 @@ object ExtensionJsRuntime {
             val compatibilityBootstrap = """
                 (function() {
                   if (typeof this.globalThis === 'undefined') this.globalThis = this;
+                  // Rhino 1.7.x throws SyntaxError on ES6 RegExp flags 'u'/'v'/'y'/'s'/'d'.
+                  // Wrap dynamic RegExp construction to strip unsupported flags cleanly while
+                  // compile-time regex literals are normalized by normalizeEs6RegexLiterals().
+                  var NativeRegExp = this.RegExp;
+                  function sanitizeRegexFlags(flags) {
+                    if (flags == null) return '';
+                    var s = String(flags), out = '';
+                    for (var i = 0; i < s.length; i++) {
+                      var ch = s.charAt(i);
+                      if ((ch === 'g' || ch === 'i' || ch === 'm') && out.indexOf(ch) === -1) out += ch;
+                    }
+                    return out;
+                  }
+                  function QNRegExp(pattern, flags) {
+                    var safeFlags = sanitizeRegexFlags(flags);
+                    if (pattern instanceof NativeRegExp) {
+                      var pFlags = flags !== undefined ? safeFlags : sanitizeRegexFlags(pattern.flags);
+                      return new NativeRegExp(pattern.source, pFlags);
+                    }
+                    return new NativeRegExp(pattern, safeFlags);
+                  }
+                  QNRegExp.prototype = NativeRegExp.prototype;
+                  Object.setPrototypeOf(QNRegExp, NativeRegExp);
+                  this.RegExp = QNRegExp;
+                  if (typeof Uint8Array !== 'undefined') {
+                    var origU8From = Uint8Array.from;
+                    Uint8Array.from = function(source, mapFn, thisArg) {
+                      if (typeof source === 'string') {
+                        var arr = new Uint8Array(source.length);
+                        for (var i = 0; i < source.length; i++) {
+                          var ch = source.charAt(i);
+                          arr[i] = typeof mapFn === 'function' ? Number(mapFn.call(thisArg, ch, i)) & 255 : ch.charCodeAt(0) & 255;
+                        }
+                        return arr;
+                      }
+                      if (typeof origU8From === 'function') {
+                        try { return origU8From.apply(Uint8Array, arguments); } catch (_) {}
+                      }
+                      var len = source && source.length ? Number(source.length) : 0;
+                      var out = new Uint8Array(len);
+                      for (var j = 0; j < len; j++) {
+                        out[j] = typeof mapFn === 'function' ? Number(mapFn.call(thisArg, source[j], j)) & 255 : Number(source[j]) & 255;
+                      }
+                      return out;
+                    };
+                  }
                   if (!String.prototype.trimStart) {
                     String.prototype.trimStart = function() { return String(this).replace(/^\s+/, ''); };
                   }
@@ -1159,6 +1347,22 @@ object ExtensionJsRuntime {
                           }).catch(function() { return ''; });
                         } catch (error) {
                           return Promise.resolve('');
+                        }
+                      },
+                      fetchViaWebview: function(url, options) {
+                        try {
+                          var opts = options && typeof options === 'object' ? {
+                            waitForSelector: options.waitForSelector != null ? String(options.waitForSelector) : null,
+                            timeoutMs: options.timeoutMs != null ? Number(options.timeoutMs) : 15000,
+                            settleMs: options.settleMs != null ? Number(options.settleMs) : 400
+                          } : {};
+                          var res = JSON.parse(__qnFetchViaWebview(String(url), JSON.stringify(opts)));
+                          return Promise.resolve(res);
+                        } catch (error) {
+                          if (error && /Cloudflare verification required/i.test(String(error.message || error))) {
+                            return Promise.reject(error);
+                          }
+                          return Promise.resolve({ ok: false, url: String(url), html: '', error: String(error && error.message || error) });
                         }
                       },
                       fetchProto: function() {
@@ -1882,7 +2086,8 @@ object ExtensionJsRuntime {
             cx.evaluateString(scope, compatibilityBootstrap, "qn-compatibility.js", 1, null)
 
 
-            cx.evaluateString(scope, source, "extension-${extension.id}.js", 1, null)
+            val normalizedSource = normalizeEs6RegexLiterals(source)
+            cx.evaluateString(scope, normalizedSource, "extension-${extension.id}.js", 1, null)
             ScriptableObject.putProperty(scope, "__qnOperation", operation)
             ScriptableObject.putProperty(scope, "__qnArgumentsJson", arguments.toString())
             val output = if (operation == "transformChapterHtml") {
@@ -1899,7 +2104,7 @@ object ExtensionJsRuntime {
                     null,
                 )
                 if (!customScript.isNullOrBlank()) {
-                    cx.evaluateString(scope, customScript, "extension-custom.js", 1, null)
+                    cx.evaluateString(scope, normalizeEs6RegexLiterals(customScript), "extension-custom.js", 1, null)
                 }
                 val transformed = cx.evaluateString(scope, "\$.html()", "extension-custom-result.js", 1, null)
                 JSONObject.quote(Context.toString(transformed))
@@ -2018,6 +2223,530 @@ object ExtensionJsRuntime {
         val parsedResult = org.json.JSONTokener(output).nextValue()
         require(parsedResult != null) { "Extension returned invalid JSON." }
         ExecutionResult(output)
+    }
+
+    private fun isCacheableStaticAssetUrl(rawUrl: String): Boolean {
+        val parsed = runCatching { URI(rawUrl) }.getOrNull() ?: return false
+        val normalizedPath = "/" + (parsed.path ?: "").trimStart('/')
+        return normalizedPath.contains("/_next/static/") &&
+            normalizedPath.endsWith(".js", ignoreCase = true)
+    }
+
+    private fun normalizeStaticAssetCacheKey(rawUrl: String): String {
+        val parsed = runCatching { URI(rawUrl) }.getOrNull() ?: return rawUrl
+        val collapsedPath = "/" + (parsed.path ?: "").trimStart('/')
+        return URI(
+            parsed.scheme,
+            parsed.userInfo,
+            parsed.host,
+            parsed.port,
+            collapsedPath,
+            parsed.query,
+            null,
+        ).toString()
+    }
+
+    /**
+     * Rhino 1.7.x (ES6 mode) rejects ES6 RegExp flags such as `u`, `v`, `y`, `s`, `d`
+     * and ES6 `\u{...}` Unicode code-point escapes inside regex literals (including
+     * astral ranges such as `\u{E0000}-\u{E007F}` used in Fenrir Realm).
+     *
+     * Scan JavaScript lexically (preserving strings, comments, template literals, and
+     * division `/` operators) and convert ES6 regex literals into equivalent ES5-compatible
+     * UTF-16 regex literals.
+     */
+    internal fun normalizeEs6RegexLiterals(source: String): String {
+        val out = StringBuilder(source.length + 64)
+        var i = 0
+        val n = source.length
+        var canStartRegex = true
+        var prevNonWsChar = '\u0000'
+        val braceIsTemplateExpr = ArrayDeque<Boolean>()
+        val parenNextCanStartRegex = ArrayDeque<Boolean>()
+
+        fun readEscapedChar(pos: Int): Int {
+            if (pos + 1 < n) return pos + 2
+            return n
+        }
+
+        val regexPrecedingKeywords = setOf(
+            "return", "throw", "case", "in", "instanceof", "typeof", "void",
+            "delete", "await", "yield", "new", "else", "do", "of", "export", "default"
+        )
+        val controlParenKeywords = setOf("if", "while", "for", "with")
+        var lastKeywordWasControl = false
+
+        while (i < n) {
+            val ch = source[i]
+            when {
+                ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' -> {
+                    out.append(ch)
+                    i++
+                }
+                ch == '/' && i + 1 < n && source[i + 1] == '/' -> {
+                    val start = i
+                    i += 2
+                    while (i < n && source[i] != '\n' && source[i] != '\r') i++
+                    out.append(source, start, i)
+                }
+                ch == '/' && i + 1 < n && source[i + 1] == '*' -> {
+                    val start = i
+                    i += 2
+                    while (i + 1 < n && !(source[i] == '*' && source[i + 1] == '/')) i++
+                    i = if (i + 1 < n) i + 2 else n
+                    out.append(source, start, i)
+                }
+                ch == '\'' || ch == '"' -> {
+                    val quote = ch
+                    val start = i
+                    i++
+                    while (i < n) {
+                        val c = source[i]
+                        if (c == '\\') {
+                            i = readEscapedChar(i)
+                        } else if (c == quote) {
+                            i++
+                            break
+                        } else {
+                            i++
+                        }
+                    }
+                    out.append(source, start, i)
+                    canStartRegex = false
+                    lastKeywordWasControl = false
+                    prevNonWsChar = quote
+                }
+                ch == '`' -> {
+                    out.append(ch)
+                    i++
+                    while (i < n) {
+                        val tc = source[i]
+                        if (tc == '\\') {
+                            val endEsc = readEscapedChar(i)
+                            out.append(source, i, endEsc)
+                            i = endEsc
+                        } else if (tc == '$' && i + 1 < n && source[i + 1] == '{') {
+                            out.append("\${")
+                            i += 2
+                            braceIsTemplateExpr.addLast(true)
+                            canStartRegex = true
+                            lastKeywordWasControl = false
+                            prevNonWsChar = '{'
+                            break
+                        } else if (tc == '`') {
+                            out.append('`')
+                            i++
+                            canStartRegex = false
+                            lastKeywordWasControl = false
+                            prevNonWsChar = '`'
+                            break
+                        } else {
+                            out.append(tc)
+                            i++
+                        }
+                    }
+                }
+                ch == '}' && braceIsTemplateExpr.isNotEmpty() && braceIsTemplateExpr.last() -> {
+                    braceIsTemplateExpr.removeLast()
+                    out.append('}')
+                    i++
+                    // Resume outer template literal body until next `${` or closing `` ` ``.
+                    while (i < n) {
+                        val tc = source[i]
+                        if (tc == '\\') {
+                            val endEsc = readEscapedChar(i)
+                            out.append(source, i, endEsc)
+                            i = endEsc
+                        } else if (tc == '$' && i + 1 < n && source[i + 1] == '{') {
+                            out.append("\${")
+                            i += 2
+                            braceIsTemplateExpr.addLast(true)
+                            canStartRegex = true
+                            lastKeywordWasControl = false
+                            prevNonWsChar = '{'
+                            break
+                        } else if (tc == '`') {
+                            out.append('`')
+                            i++
+                            canStartRegex = false
+                            lastKeywordWasControl = false
+                            prevNonWsChar = '`'
+                            break
+                        } else {
+                            out.append(tc)
+                            i++
+                        }
+                    }
+                }
+                ch == '/' && canStartRegex -> {
+                    var j = i + 1
+                    var inClass = false
+                    var closed = false
+                    while (j < n) {
+                        val rc = source[j]
+                        if (rc == '\n' || rc == '\r') break
+                        if (rc == '\\') {
+                            if (j + 1 >= n || source[j + 1] == '\n' || source[j + 1] == '\r') break
+                            j += 2
+                            continue
+                        }
+                        if (rc == '[' && !inClass) {
+                            inClass = true
+                        } else if (rc == ']' && inClass) {
+                            inClass = false
+                        } else if (rc == '/' && !inClass) {
+                            closed = true
+                            break
+                        }
+                        j++
+                    }
+                    if (!closed) {
+                        out.append('/')
+                        i++
+                        canStartRegex = true
+                        lastKeywordWasControl = false
+                        prevNonWsChar = '/'
+                    } else {
+                        val body = source.substring(i + 1, j)
+                        var f = j + 1
+                        while (f < n && ((source[f] in 'a'..'z') || (source[f] in 'A'..'Z'))) {
+                            f++
+                        }
+                        val flags = source.substring(j + 1, f)
+                        out.append(rewriteEs6RegexLiteral(body, flags))
+                        i = f
+                        canStartRegex = false
+                        lastKeywordWasControl = false
+                        prevNonWsChar = '/'
+                    }
+                }
+                ch.isLetter() || ch == '_' || ch == '$' -> {
+                    val start = i
+                    val precededByDot = prevNonWsChar == '.'
+                    while (i < n && (source[i].isLetterOrDigit() || source[i] == '_' || source[i] == '$')) {
+                        i++
+                    }
+                    val ident = source.substring(start, i)
+                    out.append(ident)
+                    canStartRegex = !precededByDot && (ident in regexPrecedingKeywords)
+                    lastKeywordWasControl = !precededByDot && (ident in controlParenKeywords)
+                    prevNonWsChar = source[i - 1]
+                }
+                ch.isDigit() -> {
+                    val start = i
+                    while (i < n && (source[i].isLetterOrDigit() || source[i] == '.' || source[i] == '_')) {
+                        i++
+                    }
+                    out.append(source, start, i)
+                    canStartRegex = false
+                    lastKeywordWasControl = false
+                    prevNonWsChar = source[i - 1]
+                }
+                ch == '(' -> {
+                    out.append(ch)
+                    i++
+                    parenNextCanStartRegex.addLast(lastKeywordWasControl)
+                    canStartRegex = true
+                    lastKeywordWasControl = false
+                    prevNonWsChar = '('
+                }
+                ch == ')' -> {
+                    out.append(ch)
+                    i++
+                    canStartRegex = if (parenNextCanStartRegex.isNotEmpty()) parenNextCanStartRegex.removeLast() else false
+                    lastKeywordWasControl = false
+                    prevNonWsChar = ')'
+                }
+                ch == '{' -> {
+                    braceIsTemplateExpr.addLast(false)
+                    out.append(ch)
+                    i++
+                    canStartRegex = true
+                    lastKeywordWasControl = false
+                    prevNonWsChar = '{'
+                }
+                ch == '}' -> {
+                    if (braceIsTemplateExpr.isNotEmpty() && !braceIsTemplateExpr.last()) {
+                        braceIsTemplateExpr.removeLast()
+                    }
+                    out.append(ch)
+                    i++
+                    canStartRegex = true
+                    lastKeywordWasControl = false
+                    prevNonWsChar = '}'
+                }
+                ch == ']' -> {
+                    out.append(ch)
+                    i++
+                    canStartRegex = false
+                    lastKeywordWasControl = false
+                    prevNonWsChar = ']'
+                }
+                ch == '+' && i + 1 < n && source[i + 1] == '+' -> {
+                    out.append("++")
+                    i += 2
+                    canStartRegex = false
+                    lastKeywordWasControl = false
+                    prevNonWsChar = '+'
+                }
+                ch == '-' && i + 1 < n && source[i + 1] == '-' -> {
+                    out.append("--")
+                    i += 2
+                    canStartRegex = false
+                    lastKeywordWasControl = false
+                    prevNonWsChar = '-'
+                }
+                ch == '=' && i + 1 < n && source[i + 1] == '>' -> {
+                    out.append("=>")
+                    i += 2
+                    canStartRegex = true
+                    lastKeywordWasControl = false
+                    prevNonWsChar = '>'
+                }
+                else -> {
+                    out.append(ch)
+                    i++
+                    canStartRegex = ch != '.'
+                    lastKeywordWasControl = false
+                    prevNonWsChar = ch
+                }
+            }
+        }
+        return out.toString()
+    }
+
+    private fun rewriteEs6RegexLiteral(body: String, flags: String): String {
+        val hasUnsupportedFlag = flags.any { it !in charArrayOf('g', 'i', 'm') }
+        val hasUnicodeEscape = body.contains("\\u{")
+        if (!hasUnsupportedFlag && !hasUnicodeEscape) {
+            return "/$body/$flags"
+        }
+
+        val dotAll = 's' in flags
+        val safeFlags = buildString {
+            for (c in flags) {
+                if ((c == 'g' || c == 'i' || c == 'm') && c !in this) append(c)
+            }
+        }
+        val rewritten = StringBuilder(body.length + 16)
+        var i = 0
+        val n = body.length
+        while (i < n) {
+            val ch = body[i]
+            when {
+                ch == '\\' && i + 1 < n -> {
+                    if (body[i + 1] == 'u' && i + 2 < n && body[i + 2] == '{') {
+                        val close = body.indexOf('}', i + 3)
+                        val hex = if (close > i + 3) body.substring(i + 3, close) else ""
+                        val cp = hex.toIntOrNull(16)
+                        if (cp != null && cp in 0..0x10FFFF) {
+                            if (cp <= 0xFFFF) {
+                                rewritten.append("\\u%04X".format(Locale.US, cp))
+                            } else {
+                                rewritten.append("(?:").append(surrogatePairEscape(cp)).append(")")
+                            }
+                            i = close + 1
+                        } else {
+                            rewritten.append(ch).append(body[i + 1])
+                            i += 2
+                        }
+                    } else {
+                        rewritten.append(ch).append(body[i + 1])
+                        i += 2
+                    }
+                }
+                ch == '[' -> {
+                    val closeIdx = findCharClassEnd(body, i)
+                    val classContent = body.substring(i + 1, closeIdx)
+                    rewritten.append(rewriteEs6CharClass(classContent))
+                    i = closeIdx + 1
+                }
+                ch == '.' && dotAll -> {
+                    rewritten.append("[\\s\\S]")
+                    i++
+                }
+                else -> {
+                    rewritten.append(ch)
+                    i++
+                }
+            }
+        }
+        val finalBody = if (rewritten.isEmpty()) "(?:)" else rewritten.toString()
+        return "/$finalBody/$safeFlags"
+    }
+
+    private fun findCharClassEnd(body: String, openBracketIdx: Int): Int {
+        var i = openBracketIdx + 1
+        if (i < body.length && body[i] == '^') i++
+        if (i < body.length && body[i] == ']') i++
+        while (i < body.length) {
+            val c = body[i]
+            if (c == '\\' && i + 1 < body.length) {
+                i += 2
+            } else if (c == ']') {
+                return i
+            } else {
+                i++
+            }
+        }
+        return body.length - 1
+    }
+
+    private data class ClassToken(val raw: String, val codePoint: Int?)
+
+    private fun rewriteEs6CharClass(content: String): String {
+        if (!content.contains("\\u{")) return "[$content]"
+        val negated = content.startsWith("^")
+        val startOffset = if (negated) 1 else 0
+        val tokens = mutableListOf<ClassToken>()
+        var i = startOffset
+        val n = content.length
+        while (i < n) {
+            if (content[i] == '\\' && i + 1 < n) {
+                val next = content[i + 1]
+                when {
+                    next == 'u' && i + 2 < n && content[i + 2] == '{' -> {
+                        val close = content.indexOf('}', i + 3)
+                        val hex = if (close > i + 3) content.substring(i + 3, close) else ""
+                        val cp = hex.toIntOrNull(16)
+                        if (cp != null && cp in 0..0x10FFFF) {
+                            tokens += ClassToken(formatBmpOrRaw(cp), cp)
+                            i = close + 1
+                        } else {
+                            tokens += ClassToken("\\u", null)
+                            i += 2
+                        }
+                    }
+                    next == 'u' && i + 5 < n && content.substring(i + 2, i + 6).all { it.isDigit() || it.lowercaseChar() in 'a'..'f' } -> {
+                        val cp = content.substring(i + 2, i + 6).toInt(16)
+                        tokens += ClassToken(content.substring(i, i + 6), cp)
+                        i += 6
+                    }
+                    next == 'x' && i + 3 < n && content.substring(i + 2, i + 4).all { it.isDigit() || it.lowercaseChar() in 'a'..'f' } -> {
+                        val cp = content.substring(i + 2, i + 4).toInt(16)
+                        tokens += ClassToken(content.substring(i, i + 4), cp)
+                        i += 4
+                    }
+                    else -> {
+                        val cp = when (next) {
+                            'n' -> '\n'.code
+                            'r' -> '\r'.code
+                            't' -> '\t'.code
+                            'f' -> '\u000C'.code
+                            'v' -> '\u000B'.code
+                            '0' -> 0
+                            'd', 'D', 'w', 'W', 's', 'S', 'p', 'P', 'c' -> null
+                            else -> next.code
+                        }
+                        tokens += ClassToken(content.substring(i, i + 2), cp)
+                        i += 2
+                    }
+                }
+            } else {
+                val ch = content[i]
+                tokens += ClassToken(ch.toString(), ch.code)
+                i++
+            }
+        }
+
+        val bmpParts = StringBuilder()
+        val astralAlts = mutableListOf<String>()
+        var idx = 0
+        while (idx < tokens.size) {
+            val cur = tokens[idx]
+            val isRange = idx + 2 < tokens.size &&
+                tokens[idx + 1].raw == "-" &&
+                cur.codePoint != null &&
+                tokens[idx + 2].codePoint != null
+            if (isRange) {
+                val startCp = cur.codePoint!!
+                val endCp = tokens[idx + 2].codePoint!!
+                if (endCp <= 0xFFFF) {
+                    bmpParts.append(cur.raw).append('-').append(tokens[idx + 2].raw)
+                } else {
+                    if (startCp <= 0xFFFF) {
+                        bmpParts.append(cur.raw).append("-\\uFFFF")
+                        astralAlts += astralRangeAlternatives(0x10000, endCp)
+                    } else {
+                        astralAlts += astralRangeAlternatives(startCp, endCp)
+                    }
+                }
+                idx += 3
+            } else {
+                val cp = cur.codePoint
+                if (cp != null && cp > 0xFFFF) {
+                    astralAlts += surrogatePairEscape(cp)
+                } else {
+                    bmpParts.append(cur.raw)
+                }
+                idx++
+            }
+        }
+
+        if (astralAlts.isEmpty()) {
+            return if (negated) "[^$bmpParts]" else "[$bmpParts]"
+        }
+        if (negated) {
+            return if (bmpParts.isNotEmpty()) "[^$bmpParts]" else "[^]"
+        }
+        val alternatives = mutableListOf<String>()
+        if (bmpParts.isNotEmpty()) alternatives += "[$bmpParts]"
+        alternatives += astralAlts
+        return "(?:${alternatives.joinToString("|")})"
+    }
+
+    private fun formatBmpOrRaw(cp: Int): String =
+        if (cp <= 0xFFFF) "\\u%04X".format(Locale.US, cp) else surrogatePairEscape(cp)
+
+    private fun surrogatePairEscape(cp: Int): String {
+        val u = cp - 0x10000
+        val high = 0xD800 + (u ushr 10)
+        val low = 0xDC00 + (u and 0x3FF)
+        return "\\u%04X\\u%04X".format(Locale.US, high, low)
+    }
+
+    private fun astralRangeAlternatives(startCp: Int, endCp: Int): List<String> {
+        val s = startCp.coerceAtLeast(0x10000)
+        val e = endCp.coerceAtMost(0x10FFFF)
+        if (s > e) return emptyList()
+        val su = s - 0x10000
+        val eu = e - 0x10000
+        val hs = 0xD800 + (su ushr 10)
+        val ls = 0xDC00 + (su and 0x3FF)
+        val he = 0xD800 + (eu ushr 10)
+        val le = 0xDC00 + (eu and 0x3FF)
+
+        if (hs == he) {
+            return if (ls == le) {
+                listOf("\\u%04X\\u%04X".format(Locale.US, hs, ls))
+            } else {
+                listOf("\\u%04X[\\u%04X-\\u%04X]".format(Locale.US, hs, ls, le))
+            }
+        }
+
+        val alts = mutableListOf<String>()
+        if (ls == 0xDC00) {
+            alts += "\\u%04X[\\uDC00-\\uDFFF]".format(Locale.US, hs)
+        } else if (ls == 0xDFFF) {
+            alts += "\\u%04X\\uDFFF".format(Locale.US, hs)
+        } else {
+            alts += "\\u%04X[\\u%04X-\\uDFFF]".format(Locale.US, hs, ls)
+        }
+
+        if (hs + 1 <= he - 1) {
+            if (hs + 1 == he - 1) {
+                alts += "\\u%04X[\\uDC00-\\uDFFF]".format(Locale.US, hs + 1)
+            } else {
+                alts += "[\\u%04X-\\u%04X][\\uDC00-\\uDFFF]".format(Locale.US, hs + 1, he - 1)
+            }
+        }
+
+        if (le == 0xDC00) {
+            alts += "\\u%04X\\uDC00".format(Locale.US, he)
+        } else {
+            alts += "\\u%04X[\\uDC00-\\u%04X]".format(Locale.US, he, le)
+        }
+        return alts
     }
 
     internal fun approvedHostsForBundle(site: String, source: String): Set<String> {

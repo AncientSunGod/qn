@@ -6,6 +6,7 @@ import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.newChapterData
@@ -14,7 +15,7 @@ import com.lagradost.quicknovel.newStreamResponse
 import com.lagradost.quicknovel.setStatus
 import java.net.URLEncoder
 
-class ChikariProvider : MainAPI() {
+object ChikariProvider : MainAPI() {
     override val name = "Chikari"
     override val mainUrl = "https://chikari.moe"
     private val apiUrl = "$mainUrl/api"
@@ -60,7 +61,7 @@ class ChikariProvider : MainAPI() {
             synopsis = data.description
             tags = (data.genres?.mapNotNull { it.name } ?: emptyList()) + (data.tags?.mapNotNull { it.name } ?: emptyList())
             setStatus(data.status)
-            rating = (data.rating?.times(100))?.toInt()
+            score = Score.from10(data.rating)
         }
 
     }

@@ -1,7 +1,11 @@
 package com.lagradost.quicknovel.extensions
 
+import com.lagradost.quicknovel.network.CloudflareChallengeException
+import com.lagradost.quicknovel.network.CloudflareChallengeManager
 import com.lagradost.quicknovel.network.isCloudflareChallengeResponse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -34,7 +38,35 @@ class CloudflareRecoveryPolicyTest {
         assertTrue(isCloudflareChallengeResponse(403, null, null, "challenge", null, ""))
         assertTrue(isCloudflareChallengeResponse(200, null, null, null, "https://example.com/cdn-cgi/challenge", ""))
         assertTrue(isCloudflareChallengeResponse(403, null, null, null, null, "<div class=\"cf-turnstile\"></div>"))
+        assertTrue(isCloudflareChallengeResponse(200, null, null, null, null, "<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script>"))
+        assertTrue(isCloudflareChallengeResponse(403, "ray-3", "cloudflare", null, null, "<title>Attention Required! | Cloudflare</title>"))
         assertFalse(isCloudflareChallengeResponse(503, null, "nginx", null, null, "Service temporarily unavailable"))
         assertFalse(isCloudflareChallengeResponse(200, "ray-2", "cloudflare", null, null, "<html><body>Normal chapter text</body></html>"))
+    }
+
+    @Test
+    fun findCloudflareChallengeHandlesNestedAndCyclicCauses() {
+        val cf = CloudflareChallengeException(
+            url = "https://wtr-lab.com/en/novel/1",
+            host = "wtr-lab.com",
+            message = "Challenge detected",
+        )
+        val wrapped = IllegalStateException("Outer", RuntimeException("Middle", cf))
+        val resolved = CloudflareChallengeManager.findCloudflareChallenge(wrapped)
+        assertNotNull(resolved)
+        assertEquals("wtr-lab.com", resolved!!.host)
+
+        val selfCause = object : RuntimeException("Self") {
+            override val cause: Throwable get() = this
+        }
+        assertEquals(null, CloudflareChallengeManager.findCloudflareChallenge(selfCause))
+    }
+
+    @Test
+    fun cooldownPreventsRepeatedAutoPromptsForSameHost() {
+        val testHost = "cooldown-test-${System.nanoTime()}.example.com"
+        assertTrue(CloudflareChallengeManager.shouldAllowAutoPrompt(testHost))
+        CloudflareChallengeManager.markPromptStarted(testHost)
+        assertFalse(CloudflareChallengeManager.shouldAllowAutoPrompt(testHost))
     }
 }

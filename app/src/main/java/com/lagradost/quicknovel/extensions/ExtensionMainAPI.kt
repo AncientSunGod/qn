@@ -30,6 +30,7 @@ class ExtensionMainAPI internal constructor(
     private val testRequestOverride: ((String, String, Map<String, String>, String?) -> ExtensionHttpClient.TextResponse)? = null,
     providerName: String = extension.name,
     private val operationOverride: ((String, JSONArray) -> String?)? = null,
+    private val testWebviewOverride: ((String, String?, Long, Long) -> String?)? = null,
 ) : MainAPI() {
     override val name: String = providerName
     override val mainUrl: String = extension.site.trimEnd('/')
@@ -131,7 +132,9 @@ class ExtensionMainAPI internal constructor(
             if (pageKey.isNotEmpty() && pageKey == previousPageKey) break
             previousPageKey = pageKey
             for (result in results) {
-                combined.putIfAbsent(result.url, result)
+                if (!combined.containsKey(result.url)) {
+                    combined[result.url] = result
+                }
                 if (combined.size >= MAX_SEARCH_RESULTS) break
             }
             if (results.isEmpty() || combined.size >= MAX_SEARCH_RESULTS) break
@@ -319,6 +322,11 @@ class ExtensionMainAPI internal constructor(
         var html = runCatching { JSONTokener(result).nextValue() as? String }.getOrNull()
             ?: return@withContext null
 
+        if (html.contains("Client-side decryption error:", ignoreCase = true) && html.length < 1500) {
+            val detail = org.jsoup.Jsoup.parse(html).text().ifBlank { "Client-side chapter decryption failed." }
+            throw com.lagradost.quicknovel.ErrorLoadingException(detail)
+        }
+
         // LNReader customJS runs against the parsed chapter with Cheerio-style globals.
         // If an optional script uses an unsupported API, keep the original chapter readable.
         readCustomAsset(extension.customJsPath)?.let { script ->
@@ -364,6 +372,7 @@ class ExtensionMainAPI internal constructor(
                 testFetchOverride = testFetchOverride,
                 storageContext = context,
                 testRequestOverride = testRequestOverride,
+                testWebviewOverride = testWebviewOverride,
             ).getOrNull()?.json
 
     /**
@@ -382,16 +391,41 @@ class ExtensionMainAPI internal constructor(
                 testFetchOverride = testFetchOverride,
                 storageContext = context,
                 testRequestOverride = testRequestOverride,
+                testWebviewOverride = testWebviewOverride,
             ).getOrElse { error ->
+                val msg = error.message ?: error.javaClass.simpleName
+                val directCf = com.lagradost.quicknovel.network.CloudflareChallengeManager
+                    .findCloudflareChallenge(error)
+                val challengeCause = directCf ?: if (
+                    msg.contains("Cloudflare protection", ignoreCase = true) ||
+                    msg.contains("open the plugin in WebView", ignoreCase = true) ||
+                    msg.contains("open this chapter in WebView", ignoreCase = true) ||
+                    msg.contains("Verify in WebView", ignoreCase = true) ||
+                    msg.contains("Turnstile", ignoreCase = true) ||
+                    msg.contains("verification required", ignoreCase = true) ||
+                    msg.contains("fr_read", ignoreCase = true) ||
+                    msg.contains("cf-mitigated", ignoreCase = true) ||
+                    msg.contains("Confirm you're human", ignoreCase = true) ||
+                    msg.contains("Verifying access", ignoreCase = true)
+                ) {
+                    val host = runCatching { URI(extension.site).host.orEmpty() }.getOrDefault("")
+                    com.lagradost.quicknovel.network.CloudflareChallengeException(
+                        url = extension.site,
+                        host = host,
+                        message = msg,
+                        cause = error,
+                    )
+                } else {
+                    error
+                }
                 throw IllegalStateException(
-                    "LNReader extension '" + name + "' failed during " + operation + ": " +
-                        (error.message ?: error.javaClass.simpleName),
-                    error,
+                    "LNReader extension '$name' failed during $operation: $msg",
+                    challengeCause,
                 )
             }.json
         }
         return result ?: throw IllegalStateException(
-            "LNReader extension '" + name + "' returned no result for " + operation + ".",
+            "LNReader extension '$name' returned no result for $operation.",
         )
     }
 

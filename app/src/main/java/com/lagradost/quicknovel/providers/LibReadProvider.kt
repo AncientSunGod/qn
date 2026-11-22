@@ -1,26 +1,19 @@
 package com.lagradost.quicknovel.providers
 
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.quicknovel.ChapterData
 import com.lagradost.quicknovel.HeadMainPageResponse
-import com.lagradost.quicknovel.LoadResponse
-import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.USER_AGENT
-import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.fixUrlNull
-import com.lagradost.quicknovel.newChapterData
-import com.lagradost.quicknovel.newReview
 import com.lagradost.quicknovel.newSearchResponse
-import com.lagradost.quicknovel.newStreamResponse
-import com.lagradost.quicknovel.setStatus
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
 
-open class LibReadProvider : FreewebnovelProvider() {
+object LibReadProvider : LibReadAPI()
+
+open class LibReadAPI : FreewebnovelAPI() {
     override val name = "LibRead"
     override val mainUrl = "https://libread.com"
+
     //for some reason, now is freewebnovel
     override val secondUrl = "https://freewebnovel.com"
     override val hasMainPage = true
@@ -38,7 +31,8 @@ open class LibReadProvider : FreewebnovelProvider() {
     )
 
 
-    override fun getAcode(url:String): String = url.substringAfterLast("/").substringBeforeLast("-")
+    override fun getAcode(url: String): String =
+        url.substringAfterLast("/").substringBeforeLast("-")
 
     override suspend fun loadMainPage(
         page: Int,
@@ -52,12 +46,15 @@ open class LibReadProvider : FreewebnovelProvider() {
         val headers = document.select("div.ul-list1.ul-list1-2.ss-custom > div.li-row")
         val returnValue = headers.mapNotNull { h ->
             val h3 = h.selectFirst("h3.tit > a") ?: return@mapNotNull null
+            val title = h3.attr("title").trim().ifBlank { h3.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
+            val href = h3.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
             newSearchResponse(
-                name = h3.attr("title"),
-                url = h3.attr("href") ?: return@mapNotNull null
+                name = title,
+                url = href
             ) {
-                posterUrl = fixUrlNull(h.selectFirst("div.pic > a > img")?.attr("src"))
-                latestChapter = h.select("div.item")[2].selectFirst("> div > a")?.text()
+                posterUrl = fixUrlNull(h.selectFirst("div.pic > a > img, div.pic img")?.attr("src"))
+                latestChapter = h.select("div.item").getOrNull(2)?.selectFirst("> div > a")?.text()
             }
         }
         return HeadMainPageResponse(url, returnValue)
@@ -76,15 +73,18 @@ open class LibReadProvider : FreewebnovelProvider() {
             data = mapOf("searchkey" to query)
         ).document
 
-        return document.select("div.li-row > div.li > div.con").mapNotNull { h ->
-            val h3 = h.selectFirst("div.txt > h3.tit > a") ?: return@mapNotNull null
+        return document.select("div.li-row").mapNotNull { h ->
+            val h3 = h.selectFirst("h3.tit > a") ?: return@mapNotNull null
+            val title = h3.attr("title").trim().ifBlank { h3.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
+            val href = h3.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
 
             newSearchResponse(
-                name = h3.attr("title") ?: return@mapNotNull null,
-                url = h3.attr("href") ?: return@mapNotNull null
+                name = title,
+                url = href
             ) {
                 posterUrl = fixUrlNull(h.selectFirst("div.pic img")?.attr("src"))
-                //latestChapter = h.select("div.item")[2].selectFirst("> div > a")?.text()
+                latestChapter = h.select("div.item").getOrNull(2)?.selectFirst("> div > a")?.text()
             }
         }
     }

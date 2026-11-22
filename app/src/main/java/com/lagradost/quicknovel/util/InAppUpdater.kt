@@ -307,12 +307,13 @@ class InAppUpdater {
 
         suspend fun Activity.runAutoUpdate(checkAutoUpdate: Boolean = true): Boolean {
             val settingsManager = PreferenceManager.getDefaultSharedPreferences(this)
+            val dontDisturbUpdates = settingsManager.getBoolean("dont_disturb_updates", false)
+            val autoUpdateEnabled = settingsManager.getBoolean(
+                getString(R.string.auto_update_key),
+                true
+            )
 
-            if (!checkAutoUpdate || settingsManager.getBoolean(
-                    getString(R.string.auto_update_key),
-                    true
-                )
-            ) {
+            if (!checkAutoUpdate || (!dontDisturbUpdates && autoUpdateEnabled)) {
                 val update = getAppUpdate()
                 if (update.shouldUpdate && update.updateURL != null) {
                     runOnUiThread {
@@ -357,8 +358,8 @@ class InAppUpdater {
                             setNegativeButton(R.string.cancel) { _, _ -> }
 
                             if (checkAutoUpdate) {
-                                setNeutralButton(R.string.dont_show_again) { _, _ ->
-                                    settingsManager.edit().putBoolean("auto_update", false).apply()
+                                setNeutralButton(R.string.dont_disturb_updates) { _, _ ->
+                                    settingsManager.edit().putBoolean("dont_disturb_updates", true).apply()
                                 }
                             }
                         }

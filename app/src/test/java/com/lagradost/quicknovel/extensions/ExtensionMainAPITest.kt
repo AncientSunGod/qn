@@ -23,7 +23,7 @@ class ExtensionMainAPITest {
                 repositoryUrl = "https://example.com/plugins.min.json",
                 bundlePath = bundle.absolutePath,
             )
-            val api = ExtensionMainAPI(extension) { operation, args ->
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, args ->
                 when (operation) {
                     "getImageRequestInit" -> """{"headers":{"referrer":"https://example.com","User-Agent":"QuickNovel test"}}"""
                     "searchNovels" -> """[{"name":"Paged Novel","path":"series","cover":"https://example.com/cover.jpg"}]"""
@@ -38,7 +38,7 @@ class ExtensionMainAPITest {
                     }
                     else -> null
                 }
-            }
+            })
 
             val search = kotlinx.coroutines.runBlocking { api.search("paged") }
             assertEquals(1, search?.size)
@@ -76,7 +76,7 @@ class ExtensionMainAPITest {
                 repositoryUrl = "https://example.com/plugins.min.json",
                 bundlePath = bundle.absolutePath,
             )
-            val api = ExtensionMainAPI(extension) { operation, args ->
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, args ->
                 when (operation) {
                     "searchNovels" -> """[{"name":"Paged Novel","path":"series"}]"""
                     "parseNovel" -> """{"name":"Paged Novel","path":"series","totalPage":2,"chapter_list":[{"name":"Chapter 1","path":"chapter-1"}]}"""
@@ -86,7 +86,7 @@ class ExtensionMainAPITest {
                     }
                     else -> null
                 }
-            }
+            })
             val search = kotlinx.coroutines.runBlocking { api.search("paged") }!!
             val novel = kotlinx.coroutines.runBlocking { api.load(search.first().url) }
                 as com.lagradost.quicknovel.StreamResponse
@@ -183,7 +183,7 @@ class ExtensionMainAPITest {
                 customJsPath = customJs.absolutePath,
                 customCssPath = customCss.absolutePath,
             )
-            val api = ExtensionMainAPI(extension) { operation, _ ->
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, _ ->
                 when (operation) {
                     "searchNovels" -> """[{"name":"Asset Novel","path":"series"}]"""
                     "parseChapter" -> JSONObject.quote(
@@ -191,7 +191,7 @@ class ExtensionMainAPITest {
                     )
                     else -> null
                 }
-            }
+            })
 
             val results = kotlinx.coroutines.runBlocking { api.search("asset") }
             val html = kotlinx.coroutines.runBlocking { api.loadHtml(results!!.first().url)!! }
@@ -231,7 +231,7 @@ class ExtensionMainAPITest {
                 bundlePath = bundle.absolutePath,
             )
             var capturedOptions: JSONObject? = null
-            val api = ExtensionMainAPI(extension) { operation, args ->
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, args ->
                 when (operation) {
                     "getPluginFilters" -> """{
                         "order":["sort","language","genres"],
@@ -255,7 +255,7 @@ class ExtensionMainAPITest {
                     }
                     else -> null
                 }
-            }
+            })
 
             assertEquals(
                 listOf("Popular" to "popular", "Latest" to "latest"),
@@ -384,7 +384,7 @@ class ExtensionMainAPITest {
                 repositoryUrl = "https://example.com/plugins.min.json",
                 bundlePath = bundle.absolutePath,
             )
-            val api = ExtensionMainAPI(extension) { operation, args ->
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, args ->
                 when (operation) {
                     "searchNovels" -> """[{"name":"Sample Novel","path":"sample-novel","cover":"https://chikari.moe/cover.jpg"}]"""
                     "popularNovels" -> """[{"name":"Popular Novel","path":"popular-novel"}]"""
@@ -400,7 +400,7 @@ class ExtensionMainAPITest {
                     "parseChapter" -> org.json.JSONObject.quote("<p>Chapter text</p>")
                     else -> null
                 }
-            }
+            })
 
             assertEquals("en", api.lang)
             val search = kotlinx.coroutines.runBlocking { api.search("sample") }
@@ -443,7 +443,7 @@ class ExtensionMainAPITest {
                 bundlePath = bundle.absolutePath,
             )
             val requestedPages = mutableListOf<Int>()
-            val api = ExtensionMainAPI(extension) { operation, args ->
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, args ->
                 if (operation != "searchNovels") return@ExtensionMainAPI null
                 val page = args.getInt(1)
                 requestedPages += page
@@ -452,7 +452,7 @@ class ExtensionMainAPITest {
                     2 -> """[{"name":"Second","path":"second"}]"""
                     else -> "[]"
                 }
-            }
+            })
 
             val results = kotlinx.coroutines.runBlocking { api.search("sample") }
             assertEquals(listOf(1, 2, 3), requestedPages)
@@ -547,11 +547,11 @@ class ExtensionMainAPITest {
                 bundlePath = bundle.absolutePath,
             )
             var calls = 0
-            val api = ExtensionMainAPI(extension) { operation, _ ->
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, _ ->
                 if (operation != "searchNovels") return@ExtensionMainAPI null
                 calls++
                 """[{"name":"Same result","path":"same"}]"""
-            }
+            })
 
             val results = kotlinx.coroutines.runBlocking { api.search("sample") }
             assertEquals(2, calls)
@@ -757,5 +757,73 @@ class ExtensionMainAPITest {
         }
     }
 
+    @Test
+    fun throwsErrorLoadingExceptionWhenChapterContainsClientSideDecryptionError() {
+        val bundle = File.createTempFile("quicknovel-decrypt-err-", ".js")
+        bundle.writeText("module.exports = {};")
+        try {
+            val extension = InstalledExtension(
+                id = "wtrlab-decrypt-err",
+                name = "WTR-LAB",
+                site = "https://wtr-lab.com/",
+                version = "1.2.6",
+                language = "English",
+                url = "https://example.com/wtrlab.js",
+                repositoryUrl = "https://example.com/plugins.min.json",
+                bundlePath = bundle.absolutePath,
+            )
+            val api = ExtensionMainAPI(extension, operationOverride = { operation, _ ->
+                when (operation) {
+                    "parseChapter" -> JSONObject.quote(
+                        "<h3>25. Chapter Title</h3><p><p>Client-side decryption error:</p>Error: Tag mismatch</p>"
+                    )
+                    else -> null
+                }
+            })
+            val failure = runCatching {
+                kotlinx.coroutines.runBlocking { api.loadHtml("https://wtr-lab.com/en/serie-1/n/chapter-25#qn_ext_path=ch-25") }
+            }.exceptionOrNull()
+            assertTrue(failure is com.lagradost.quicknovel.ErrorLoadingException)
+            assertTrue(failure!!.message.orEmpty().contains("Client-side decryption error:"))
+        } finally {
+            bundle.delete()
+        }
+    }
+
+    @Test
+    fun wrapsJsCloudflareMessageIntoCloudflareChallengeException() {
+        val bundle = File.createTempFile("quicknovel-cf-wrap-", ".js")
+        bundle.writeText(
+            """
+            module.exports = {
+              popularNovels: function() {
+                throw new Error('Blocked by Cloudflare protection. Please open the plugin in WebView.');
+              }
+            };
+            """.trimIndent()
+        )
+        try {
+            val extension = InstalledExtension(
+                id = "cf-wrap-test",
+                name = "CF Test",
+                site = "https://example.com",
+                version = "1.0.0",
+                language = "English",
+                url = "https://example.com/cf.js",
+                repositoryUrl = "https://example.com/plugins.min.json",
+                bundlePath = bundle.absolutePath,
+            )
+            val api = ExtensionMainAPI(extension)
+            val failure = runCatching {
+                kotlinx.coroutines.runBlocking { api.loadMainPage(1, null, null, null) }
+            }.exceptionOrNull()
+            assertNotNull(failure)
+            val cf = com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(failure)
+            assertNotNull(cf)
+            assertEquals("example.com", cf!!.host)
+        } finally {
+            bundle.delete()
+        }
+    }
 
 }

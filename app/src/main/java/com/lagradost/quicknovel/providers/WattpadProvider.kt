@@ -5,6 +5,7 @@ import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.fixUrlNull
@@ -17,7 +18,7 @@ import com.lagradost.quicknovel.util.AppUtils.parseJson
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 
-class WattpadProvider : MainAPI() {
+object WattpadProvider : MainAPI() {
     override val mainUrl = "https://www.wattpad.com"
     override val name = "Wattpad"
     override val hasMainPage = true
@@ -99,7 +100,7 @@ class WattpadProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search/$query"
+        val url = "$mainUrl/search/${java.net.URLEncoder.encode(query.trim(), "UTF-8")}"
 
         val document = app.get(
             url,
@@ -129,12 +130,17 @@ class WattpadProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val response = app.get(url)
-        val script_text = Regex("<script>.*?window._+remix.*?</script>").find(response.text)!!.value
+        val scriptText = Regex("<script>.*?window._+remix.*?</script>").find(response.text)?.value
+            ?: throw com.lagradost.quicknovel.ErrorLoadingException("Could not find story data")
+        val jsonMatch = Regex("\\{.*\\}").find(scriptText)?.value
+            ?: throw com.lagradost.quicknovel.ErrorLoadingException("Could not parse story data")
         //idk how to parse "routes\/story.$storyid"
-        val state = JSONObject(Regex("\\{.*\\}").find(script_text)!!.value)
+        val state = JSONObject(jsonMatch)
             .getJSONObject("state")
             .getJSONObject("loaderData")
-        val route = state.getString(state.names()!!.getString(state.length() - 1))
+        val names = state.names()
+            ?: throw com.lagradost.quicknovel.ErrorLoadingException("Missing story route data")
+        val route = state.getString(names.getString(state.length() - 1))
 
         val novel = parseJson<LoadPageResponse>(route)
         val story = novel.story
@@ -186,7 +192,7 @@ class WattpadProvider : MainAPI() {
             newReview(reviewTxt) {
                 username = item.username
                 date = item.createdAt
-                rating = item.rate?.times(200)
+                score = Score.from5(item.rate)
             }
         } ?: emptyList()
     }
@@ -200,7 +206,8 @@ class WattpadProvider : MainAPI() {
 
         val parsed = parseJson<Map<String, ChapterWrapper>>(scriptText)
 
-        val data = parsed.values.first().data
+        val data = parsed.values.firstOrNull()?.data
+            ?: throw com.lagradost.quicknovel.ErrorLoadingException("Failed to get Data")
 
         val totalPages = data.pages
         val textUrlBase = data.textUrl.text

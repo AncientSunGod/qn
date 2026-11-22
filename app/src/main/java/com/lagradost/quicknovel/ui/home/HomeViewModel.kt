@@ -5,6 +5,9 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lagradost.quicknovel.extensions.ExtensionProviderRegistry
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.util.Apis
@@ -13,6 +16,9 @@ import com.lagradost.quicknovel.util.Apis.Companion.getApiProviderLangSettings
 class HomeViewModel : ViewModel() {
     private val _homeApis = MutableLiveData<List<MainAPI>>()
     val homeApis: LiveData<List<MainAPI>> = _homeApis
+
+    private val _homeApisState = MutableStateFlow<List<MainAPI>>(emptyList())
+    val homeApisState: StateFlow<List<MainAPI>> = _homeApisState.asStateFlow()
 
     init {
         refreshApis()
@@ -28,8 +34,10 @@ class HomeViewModel : ViewModel() {
 
     fun refreshApis() {
         val langs = getApiProviderLangSettings()
-        _homeApis.value = Apis.apis.filter { api ->
+        val filtered = Apis.apis.filter { api ->
             api.hasMainPage && langs.contains(api.lang)
         }
+        _homeApis.value = filtered
+        _homeApisState.value = filtered
     }
 }

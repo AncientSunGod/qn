@@ -3,7 +3,6 @@ package com.lagradost.quicknovel.providers
 import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
-import com.lagradost.quicknovel.MainActivity.Companion.app
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.fixUrl
@@ -11,11 +10,10 @@ import com.lagradost.quicknovel.fixUrlNull
 import com.lagradost.quicknovel.newChapterData
 import com.lagradost.quicknovel.newSearchResponse
 import com.lagradost.quicknovel.newStreamResponse
-import org.jsoup.Jsoup
 import kotlin.math.roundToInt
 
 // cloudflare
-class NovelsOnlineProvider : MainAPI() {
+object NovelsOnlineProvider : MainAPI() {
     override val name = "NovelsOnline"
     override val mainUrl = "https://novelsonline.org"
     override val hasMainPage = true
@@ -76,15 +74,19 @@ class NovelsOnlineProvider : MainAPI() {
 
         val headers = document.select("div.top-novel-block")
 
-        val list = headers.map { h ->
-            val adata = h.selectFirst("div.top-novel-header > h2 > a")
+        val list = headers.mapNotNull { h ->
+            val adata = h.selectFirst("div.top-novel-header > h2 > a") ?: return@mapNotNull null
+            val href = adata.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val title = adata.text().takeIf { it.isNotBlank() } ?: return@mapNotNull null
             newSearchResponse(
-                name = adata!!.text(),
-                url = adata.attr("href"),
+                name = title,
+                url = href,
             ) {
                 //posterHeaders = interceptor.getCookieHeaders(url).toMap()
-                posterUrl = h.selectFirst("div.top-novel-content > div.top-novel-cover > a > img")!!
-                    .attr("src")
+                posterUrl = fixUrlNull(
+                    h.selectFirst("div.top-novel-content > div.top-novel-cover > a > img")
+                        ?.attr("src")
+                )
             }
         }
         return HeadMainPageResponse(url, list)
@@ -119,10 +121,12 @@ class NovelsOnlineProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
-        val name = document.selectFirst("h1")!!.text()
+        val name = document.selectFirst("h1")?.text()
+            ?: throw com.lagradost.quicknovel.ErrorLoadingException("No title")
 
-        val data = document.select("ul.chapter-chs > li > a").map { c ->
-            newChapterData(name = c.text(), url = c.attr("href"))
+        val data = document.select("ul.chapter-chs > li > a").mapNotNull { c ->
+            val href = c.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            newChapterData(name = c.text(), url = href)
         }
 
         return newStreamResponse(url = url, name = name, data = data) {

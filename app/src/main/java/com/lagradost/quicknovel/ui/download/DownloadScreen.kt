@@ -59,6 +59,7 @@ import com.lagradost.cloudstream4.compose.ActionDialog
 import com.lagradost.cloudstream4.compose.Screen
 import com.lagradost.cloudstream4.compose.SinglePairSelectDialog
 import com.lagradost.cloudstream4.compose.rounded
+import com.lagradost.cloudstream4.rememberAppSettings
 import com.lagradost.cloudstream4.theme.CloudStreamPreviewTheme
 import com.lagradost.quicknovel.MainActivity
 import com.lagradost.quicknovel.R
@@ -73,7 +74,7 @@ import com.lagradost.quicknovel.ui.common.SortingMethodPair
 import com.lagradost.quicknovel.ui.common.SortingMethodType
 import com.lagradost.quicknovel.ui.common.normalSortingMethods
 import com.lagradost.quicknovel.ui.common.sortingMethods
-import com.mihon.common.preference.AndroidPreferenceStore
+import com.mihon.material.padding
 import com.mihon.presentation.settings.collectAsState
 import kotlinx.collections.immutable.PersistentList
 import kotlinx.collections.immutable.persistentListOf
@@ -84,12 +85,12 @@ import kotlin.time.Duration.Companion.milliseconds
 object DownloadScreen : Screen {
     @Composable
     override fun Content() {
-        val viewModel = viewModel<DownloadViewModel2>()
+        val settings = rememberAppSettings()
+        val viewModel = viewModel<DownloadViewModel2> { DownloadViewModel2(settings) }
         val state by viewModel.state.collectAsStateWithLifecycle()
         DownloadScreen(state, viewModel::onAction)
     }
 }
-
 
 @Composable
 fun DownloadScreen(
@@ -98,7 +99,7 @@ fun DownloadScreen(
 ) {
     DownloadSort(
         downloadSortingMethod = state.downloadSortingMethod,
-        regularSortingMethod = state.regularSortingMethod,
+        regularSortingMethod = state.bookmarkSortingMethod,
         sortingMethodDialog = state.dialog,
         onAction = onAction
     )
@@ -112,10 +113,9 @@ fun DownloadScreen(
         R.string.type_dropped,
     )
 
-    val context = LocalContext.current
-    val store = AndroidPreferenceStore(context)
+    val store = rememberAppSettings()
 
-    val downloadIsRow = store.getBoolean(stringResource(R.string.download_list_view_key), true)
+    val downloadIsRow = store.downloads.isRow
     val downloadIsRowState by downloadIsRow.collectAsState()
 
     var fabExpanded by remember { mutableStateOf(false) }
@@ -123,19 +123,18 @@ fun DownloadScreen(
     Scaffold(
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                modifier = Modifier.padding(bottom = 40.dp),
+                modifier = Modifier.padding(bottom = 52.dp),
                 onClick = {
                     onAction(DownloadPageAction.ShowSorting)
                 },
-                // Elevation actually changes the color, because who wanted a sane framework
                 elevation = FloatingActionButtonDefaults.elevation(
-                    defaultElevation = 0.dp,
-                    pressedElevation = 0.dp,
-                    focusedElevation = 0.dp,
-                    hoveredElevation = 0.dp
+                    defaultElevation = 2.dp,
+                    pressedElevation = 4.dp,
+                    focusedElevation = 2.dp,
+                    hoveredElevation = 3.dp
                 ),
-                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                contentColor = MaterialTheme.colorScheme.onBackground,
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                 text = {
                     Text(stringResource(R.string.filter_dialog_sort_by))
                 },
@@ -443,22 +442,47 @@ fun DownloadRow(
         },
         modifier = Modifier.fillMaxSize()
     ) {
-        SearchList(
-            isRow = isRow,
-            state = row,
-            searchAction = searchAction,
-            modifier = Modifier,
-            lazyGridState = lazyGridState,
-            footer = if (index == 0) {
-                if (isRow) {
-                    ::RowFooter
-                } else {
-                    ::BoxFooter
+        if (index > 0 && row.sorted.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(24.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_baseline_bookmark_24),
+                        contentDescription = null,
+                        modifier = Modifier.size(44.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = stringResource(R.string.no_data),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
                 }
-            } else {
-                null
             }
-        )
+        } else {
+            SearchList(
+                isRow = isRow,
+                state = row,
+                searchAction = searchAction,
+                modifier = Modifier,
+                lazyGridState = lazyGridState,
+                footer = if (index == 0) {
+                    if (isRow) {
+                        ::RowFooter
+                    } else {
+                        ::BoxFooter
+                    }
+                } else {
+                    null
+                }
+            )
+        }
     }
 }
 
@@ -529,15 +553,14 @@ fun BoxFooter() {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(40.dp)
-                .padding(horizontal = 5.dp),
+                .height(45.dp)
+                .padding(horizontal = MaterialTheme.padding.extraSmall),
             contentAlignment = Alignment.Center
         ) {
             Text(
                 text = stringResource(R.string.import_epub),
                 color = MaterialTheme.colorScheme.onBackground,
-                fontSize = 13.sp,
-                lineHeight = 14.sp,
+                style = MaterialTheme.typography.bodyMedium,
                 maxLines = 2,
                 textAlign = TextAlign.Center,
                 overflow = TextOverflow.Ellipsis

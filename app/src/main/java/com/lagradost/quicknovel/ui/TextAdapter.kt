@@ -591,9 +591,30 @@ class TextAdapter(
     private fun bindFailed(binding: ViewBinding, obj: FailedSpanned) {
         if (binding !is SingleFailedBinding) return
 
-        binding.root.setText(obj.reason)
+        val cfChallenge = com.lagradost.quicknovel.network.CloudflareChallengeManager
+            .findCloudflareChallenge(obj.cause)
+        if (cfChallenge != null) {
+            binding.root.text = "${obj.reason.asString(binding.root.context)}\n\nTap to open verification"
+        } else {
+            binding.root.setText(obj.reason)
+        }
 
         binding.root.setOnClickListener {
+            if (cfChallenge != null) {
+                val readerActivity = binding.root.context as? com.lagradost.quicknovel.ReadActivity2
+                if (readerActivity != null) {
+                    readerActivity.openCloudflareVerification(obj.index, cfChallenge.url)
+                } else {
+                    com.lagradost.quicknovel.network.CloudflareChallengeManager.launchVerification(
+                        binding.root.context,
+                        cfChallenge.url,
+                    ) {
+                        viewModel.reloadChapter(obj.index)
+                    }
+                }
+                return@setOnClickListener
+            }
+
             if (obj.cause == null) {
                 viewModel.switchVisibility()
                 return@setOnClickListener

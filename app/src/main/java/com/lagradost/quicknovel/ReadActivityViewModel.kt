@@ -700,6 +700,26 @@ class ReadActivityViewModel : ViewModel() {
         updateReadArea(seekToDesired = true)
     }
 
+    fun getCurrentChapterUrl(): String? {
+        if (!this::book.isInitialized) return null
+        val idx = desiredIndex?.index ?: currentIndex
+        if (idx < 0 || idx >= book.size()) return null
+        return book.getLoadingStatus(idx)?.takeIf {
+            it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
+        }
+    }
+
+    fun retryCurrentOrReinit(intent: Intent?, context: ReadActivity2) {
+        if (isReaderReady()) {
+            refreshChapters()
+        } else {
+            synchronized(this) {
+                readerInitializationKey = null
+            }
+            init(intent, context)
+        }
+    }
+
     private suspend fun updateIndexAsync(
         index: Int,
         notify: Boolean = true,
@@ -712,6 +732,11 @@ class ReadActivityViewModel : ViewModel() {
         for (idx in range) {
             requested += idx
             loadIndividualChapter(idx, notify = notify, postLoading = postLoading)
+            val hitChallenge = chapterMutex.withLock {
+                val failure = chapterData[idx] as? Resource.Failure
+                com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(failure?.cause) != null
+            }
+            if (hitChallenge) break
         }
 
     }
@@ -945,7 +970,10 @@ class ReadActivityViewModel : ViewModel() {
             val data = safeApiCall {
                 book.getChapterData(index, reload)
             }.map { text ->
-                val rawText = preParseHtml(text, authorNotes)
+                val showAuthorNotes = context?.let {
+                    com.lagradost.cloudstream4.AppSettings(it).reader.authorNotes.get()
+                } ?: false
+                val rawText = preParseHtml(text, showAuthorNotes)
                 // val renderedBuilder = SpannableStringBuilder()
                 // val lengths : IntArray
                 // val nodes : Array<Node>

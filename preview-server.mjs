@@ -32,14 +32,144 @@ function formatFileSize(bytes) {
   return `${mb.toFixed(1)} MB`;
 }
 
+const APK_VALIDATION_CACHE = new Map();
+const MAX_CD_BYTES = 32 * 1024 * 1024;
+
+function validateApkZip(filePath, stats) {
+  if (!stats || !stats.isFile() || stats.size < 52) return false;
+  const cacheKey = `${filePath}:${stats.size}:${stats.mtimeMs}`;
+  if (APK_VALIDATION_CACHE.has(cacheKey)) {
+    return APK_VALIDATION_CACHE.get(cacheKey);
+  }
+
+  let isValid = false;
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+
+    // 1. Verify ZIP local file header signature (PK\x03\x04) at byte 0
+    const sigBuf = Buffer.allocUnsafe(4);
+    if (fs.readSync(fd, sigBuf, 0, 4, 0) !== 4) {
+      return false;
+    }
+    if (sigBuf[0] !== 0x50 || sigBuf[1] !== 0x4b || sigBuf[2] !== 0x03 || sigBuf[3] !== 0x04) {
+      return false;
+    }
+
+    // 2. Locate End of Central Directory (EOCD: PK\x05\x06) in trailing bytes
+    const tailLen = Math.min(stats.size, 22 + 65535);
+    const tailStart = stats.size - tailLen;
+    const tailBuf = Buffer.allocUnsafe(tailLen);
+    if (fs.readSync(fd, tailBuf, 0, tailLen, tailStart) !== tailLen) {
+      return false;
+    }
+
+    let eocdRel = -1;
+    for (let i = tailLen - 22; i >= 0; i--) {
+      if (
+        tailBuf[i] === 0x50 &&
+        tailBuf[i + 1] === 0x4b &&
+        tailBuf[i + 2] === 0x05 &&
+        tailBuf[i + 3] === 0x06
+      ) {
+        const commentLen = tailBuf.readUInt16LE(i + 20);
+        if (i + 22 + commentLen === tailLen) {
+          eocdRel = i;
+          break;
+        }
+      }
+    }
+    if (eocdRel < 0) return false;
+
+    const eocdOffset = tailStart + eocdRel;
+    const diskNumber = tailBuf.readUInt16LE(eocdRel + 4);
+    const cdStartDisk = tailBuf.readUInt16LE(eocdRel + 6);
+    const entriesOnDisk = tailBuf.readUInt16LE(eocdRel + 8);
+    const totalEntries = tailBuf.readUInt16LE(eocdRel + 10);
+    const cdSize = tailBuf.readUInt32LE(eocdRel + 12);
+    const cdOffset = tailBuf.readUInt32LE(eocdRel + 16);
+
+    if (
+      diskNumber !== 0 ||
+      cdStartDisk !== 0 ||
+      entriesOnDisk !== totalEntries ||
+      totalEntries === 0 ||
+      cdSize === 0 ||
+      cdSize > MAX_CD_BYTES ||
+      cdOffset + cdSize > eocdOffset
+    ) {
+      return false;
+    }
+
+    // 3. Parse every Central Directory entry and confirm required APK components
+    const cdBuf = Buffer.allocUnsafe(cdSize);
+    if (fs.readSync(fd, cdBuf, 0, cdSize, cdOffset) !== cdSize) {
+      return false;
+    }
+
+    let cursor = 0;
+    let parsedEntries = 0;
+    let hasManifest = false;
+    let hasDex = false;
+
+    while (cursor < cdSize) {
+      if (cursor + 46 > cdSize) return false;
+      if (
+        cdBuf[cursor] !== 0x50 ||
+        cdBuf[cursor + 1] !== 0x4b ||
+        cdBuf[cursor + 2] !== 0x01 ||
+        cdBuf[cursor + 3] !== 0x02
+      ) {
+        return false;
+      }
+      const compSize = cdBuf.readUInt32LE(cursor + 20);
+      const nameLen = cdBuf.readUInt16LE(cursor + 28);
+      const extraLen = cdBuf.readUInt16LE(cursor + 30);
+      const commentLen = cdBuf.readUInt16LE(cursor + 32);
+      const localHeaderOffset = cdBuf.readUInt32LE(cursor + 42);
+
+      const recordLen = 46 + nameLen + extraLen + commentLen;
+      if (cursor + recordLen > cdSize) return false;
+      if (localHeaderOffset + 30 + nameLen + compSize > cdOffset) return false;
+
+      const entryName = cdBuf.toString('utf8', cursor + 46, cursor + 46 + nameLen);
+      if (entryName === 'AndroidManifest.xml') {
+        hasManifest = true;
+      } else if (/\.dex$/i.test(entryName)) {
+        hasDex = true;
+      }
+
+      cursor += recordLen;
+      parsedEntries += 1;
+    }
+
+    isValid = cursor === cdSize && parsedEntries === totalEntries && hasManifest && hasDex;
+    return isValid;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error
+      }
+    }
+    if (APK_VALIDATION_CACHE.size > 16) {
+      APK_VALIDATION_CACHE.clear();
+    }
+    APK_VALIDATION_CACHE.set(cacheKey, isValid);
+  }
+}
+
 function getApkMeta() {
-  let newest = null;
+  let newestValid = null;
   for (const candidate of APK_PATHS) {
     try {
       const stats = fs.statSync(candidate);
-      if (!stats.isFile()) continue;
-      if (!newest || stats.mtimeMs > newest.mtimeMs) {
-        newest = {
+      if (!validateApkZip(candidate, stats)) continue;
+      if (!newestValid || stats.mtimeMs > newestValid.mtimeMs) {
+        newestValid = {
           filePath: candidate,
           mtimeMs: stats.mtimeMs,
           sizeBytes: stats.size,
@@ -49,10 +179,10 @@ function getApkMeta() {
         };
       }
     } catch {
-      // Ignore missing candidate path
+      // Ignore missing or unreadable candidate path
     }
   }
-  return newest;
+  return newestValid;
 }
 
 function resolveFaviconPath() {
@@ -288,7 +418,7 @@ function renderHtmlPage() {
       </div>
       <div class="meta-item">
         <span class="meta-label">Version</span>
-        <span class="meta-value">3.8.1-DEBUG (57)</span>
+        <span class="meta-value">3.9.1-DEBUG (57)</span>
       </div>
       <div class="meta-item">
         <span class="meta-label">Compatibility</span>
@@ -413,200 +543,230 @@ function parseByteRange(rangeHeader, totalSize) {
   return { start, end };
 }
 
+function pipeFile(filePath, options, res) {
+  const stream = fs.createReadStream(filePath, options);
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    }
+    if (!res.writableEnded) {
+      res.end('Internal Server Error');
+    }
+  });
+  res.on('close', () => {
+    if (!stream.destroyed) stream.destroy();
+  });
+  stream.pipe(res);
+}
+
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const method = req.method || 'GET';
+  try {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const method = req.method || 'GET';
 
-  if (method !== 'GET' && method !== 'HEAD') {
-    res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Method Not Allowed');
-    return;
-  }
+    if (method !== 'GET' && method !== 'HEAD') {
+      res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Method Not Allowed');
+      return;
+    }
 
-  if (url.pathname === '/health') {
-    const meta = getApkMeta();
-    const body = JSON.stringify({
-      ok: true,
-      apkAvailable: Boolean(meta),
-      apkSizeBytes: meta ? meta.sizeBytes : 0,
-    });
-    res.writeHead(200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Content-Length': Buffer.byteLength(body),
-      'Cache-Control': 'no-store',
-    });
-    res.end(method === 'HEAD' ? undefined : body);
-    return;
-  }
-
-  if (url.pathname === '/apk-info') {
-    const meta = getApkMeta();
-    const payload = meta
-      ? {
-          available: true,
-          filename: 'QuickNovel-debug.apk',
-          sizeBytes: meta.sizeBytes,
-          sizeLabel: meta.sizeLabel,
-          updatedIso: meta.updatedIso,
-          updatedHuman: meta.updatedHuman,
-          chunkSize: CHUNK_SIZE_BYTES,
-        }
-      : {
-          available: false,
-          filename: 'QuickNovel-debug.apk',
-          sizeBytes: 0,
-          sizeLabel: 'Unavailable',
-          chunkSize: CHUNK_SIZE_BYTES,
-        };
-    const body = JSON.stringify(payload);
-    res.writeHead(200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Content-Length': Buffer.byteLength(body),
-      'Cache-Control': 'no-store',
-    });
-    res.end(method === 'HEAD' ? undefined : body);
-    return;
-  }
-
-  if (url.pathname === '/apk-chunk') {
-    const meta = getApkMeta();
-    if (!meta) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('APK not found.');
-      return;
-    }
-    const offset = Number(url.searchParams.get('offset') ?? '0');
-    const requestedLength = Number(url.searchParams.get('length') ?? String(CHUNK_SIZE_BYTES));
-    if (
-      !Number.isInteger(offset) ||
-      !Number.isInteger(requestedLength) ||
-      offset < 0 ||
-      offset >= meta.sizeBytes ||
-      requestedLength <= 0 ||
-      requestedLength > MAX_CHUNK_BYTES
-    ) {
-      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Invalid chunk offset or length.');
-      return;
-    }
-    const clampedLength = Math.min(requestedLength, meta.sizeBytes - offset);
-    res.writeHead(200, {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': clampedLength,
-      'Cache-Control': 'no-store',
-      'X-APK-Offset': String(offset),
-      'X-APK-Total-Size': String(meta.sizeBytes),
-    });
-    if (method === 'HEAD') {
-      res.end();
-      return;
-    }
-    fs.createReadStream(meta.filePath, { start: offset, end: offset + clampedLength - 1 }).pipe(res);
-    return;
-  }
-
-  if (url.pathname === '/favicon.ico') {
-    const faviconPath = resolveFaviconPath();
-    if (!faviconPath) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Not Found');
-      return;
-    }
-    const stat = fs.statSync(faviconPath);
-    res.writeHead(200, {
-      'Content-Type': faviconPath.endsWith('.png') ? 'image/png' : 'image/x-icon',
-      'Content-Length': stat.size,
-      'Cache-Control': 'public, max-age=3600',
-    });
-    if (method === 'HEAD') {
-      res.end();
-      return;
-    }
-    fs.createReadStream(faviconPath).pipe(res);
-    return;
-  }
-
-  if (url.pathname === '/icon.png') {
-    if (!fs.existsSync(ICON_PATH)) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Not Found');
-      return;
-    }
-    const stat = fs.statSync(ICON_PATH);
-    res.writeHead(200, {
-      'Content-Type': 'image/png',
-      'Content-Length': stat.size,
-      'Cache-Control': 'public, max-age=3600',
-    });
-    if (method === 'HEAD') {
-      res.end();
-      return;
-    }
-    fs.createReadStream(ICON_PATH).pipe(res);
-    return;
-  }
-
-  if (url.pathname === '/app-debug.apk') {
-    const apkMeta = getApkMeta();
-    if (!apkMeta) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('APK not found. Run ./gradlew :app:assembleDebug first.');
-      return;
-    }
-    const range = parseByteRange(req.headers.range, apkMeta.sizeBytes);
-    if (range && range.invalid) {
-      res.writeHead(416, {
-        'Content-Range': `bytes */${apkMeta.sizeBytes}`,
-        'Content-Type': 'text/plain; charset=utf-8',
+    if (url.pathname === '/health') {
+      const meta = getApkMeta();
+      const body = JSON.stringify({
+        ok: true,
+        apkAvailable: Boolean(meta),
+        apkSizeBytes: meta ? meta.sizeBytes : 0,
       });
-      res.end('Range Not Satisfiable');
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'Cache-Control': 'no-store',
+      });
+      res.end(method === 'HEAD' ? undefined : body);
       return;
     }
-    if (range) {
-      const length = range.end - range.start + 1;
-      res.writeHead(206, {
+
+    if (url.pathname === '/apk-info') {
+      const meta = getApkMeta();
+      const payload = meta
+        ? {
+            available: true,
+            filename: 'QuickNovel-debug.apk',
+            sizeBytes: meta.sizeBytes,
+            sizeLabel: meta.sizeLabel,
+            updatedIso: meta.updatedIso,
+            updatedHuman: meta.updatedHuman,
+            chunkSize: CHUNK_SIZE_BYTES,
+          }
+        : {
+            available: false,
+            filename: 'QuickNovel-debug.apk',
+            sizeBytes: 0,
+            sizeLabel: 'Unavailable',
+            chunkSize: CHUNK_SIZE_BYTES,
+          };
+      const body = JSON.stringify(payload);
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'Cache-Control': 'no-store',
+      });
+      res.end(method === 'HEAD' ? undefined : body);
+      return;
+    }
+
+    if (url.pathname === '/apk-chunk') {
+      const meta = getApkMeta();
+      if (!meta) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('APK not found.');
+        return;
+      }
+      const offset = Number(url.searchParams.get('offset') ?? '0');
+      const requestedLength = Number(url.searchParams.get('length') ?? String(CHUNK_SIZE_BYTES));
+      if (
+        !Number.isInteger(offset) ||
+        !Number.isInteger(requestedLength) ||
+        offset < 0 ||
+        offset >= meta.sizeBytes ||
+        requestedLength <= 0 ||
+        requestedLength > MAX_CHUNK_BYTES
+      ) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Invalid chunk offset or length.');
+        return;
+      }
+      const clampedLength = Math.min(requestedLength, meta.sizeBytes - offset);
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': clampedLength,
+        'Cache-Control': 'no-store',
+        'X-APK-Offset': String(offset),
+        'X-APK-Total-Size': String(meta.sizeBytes),
+      });
+      if (method === 'HEAD') {
+        res.end();
+        return;
+      }
+      pipeFile(meta.filePath, { start: offset, end: offset + clampedLength - 1 }, res);
+      return;
+    }
+
+    if (url.pathname === '/favicon.ico') {
+      const faviconPath = resolveFaviconPath();
+      if (!faviconPath) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Not Found');
+        return;
+      }
+      const stat = fs.statSync(faviconPath);
+      res.writeHead(200, {
+        'Content-Type': faviconPath.endsWith('.png') ? 'image/png' : 'image/x-icon',
+        'Content-Length': stat.size,
+        'Cache-Control': 'public, max-age=3600',
+      });
+      if (method === 'HEAD') {
+        res.end();
+        return;
+      }
+      pipeFile(faviconPath, undefined, res);
+      return;
+    }
+
+    if (url.pathname === '/icon.png') {
+      if (!fs.existsSync(ICON_PATH)) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Not Found');
+        return;
+      }
+      const stat = fs.statSync(ICON_PATH);
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': stat.size,
+        'Cache-Control': 'public, max-age=3600',
+      });
+      if (method === 'HEAD') {
+        res.end();
+        return;
+      }
+      pipeFile(ICON_PATH, undefined, res);
+      return;
+    }
+
+    if (url.pathname === '/app-debug.apk') {
+      const apkMeta = getApkMeta();
+      if (!apkMeta) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('APK not found. Run ./gradlew :app:assembleDebug first.');
+        return;
+      }
+      const range = parseByteRange(req.headers.range, apkMeta.sizeBytes);
+      if (range && range.invalid) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${apkMeta.sizeBytes}`,
+          'Content-Type': 'text/plain; charset=utf-8',
+        });
+        res.end('Range Not Satisfiable');
+        return;
+      }
+      if (range) {
+        const length = range.end - range.start + 1;
+        res.writeHead(206, {
+          'Content-Type': 'application/vnd.android.package-archive',
+          'Content-Disposition': 'attachment; filename="QuickNovel-debug.apk"',
+          'Accept-Ranges': 'bytes',
+          'Content-Range': `bytes ${range.start}-${range.end}/${apkMeta.sizeBytes}`,
+          'Content-Length': length,
+          'Cache-Control': 'no-store',
+        });
+        if (method === 'HEAD') {
+          res.end();
+          return;
+        }
+        pipeFile(apkMeta.filePath, { start: range.start, end: range.end }, res);
+        return;
+      }
+      res.writeHead(200, {
         'Content-Type': 'application/vnd.android.package-archive',
         'Content-Disposition': 'attachment; filename="QuickNovel-debug.apk"',
         'Accept-Ranges': 'bytes',
-        'Content-Range': `bytes ${range.start}-${range.end}/${apkMeta.sizeBytes}`,
-        'Content-Length': length,
+        'Content-Length': apkMeta.sizeBytes,
         'Cache-Control': 'no-store',
       });
       if (method === 'HEAD') {
         res.end();
         return;
       }
-      fs.createReadStream(apkMeta.filePath, { start: range.start, end: range.end }).pipe(res);
+      pipeFile(apkMeta.filePath, undefined, res);
       return;
     }
-    res.writeHead(200, {
-      'Content-Type': 'application/vnd.android.package-archive',
-      'Content-Disposition': 'attachment; filename="QuickNovel-debug.apk"',
-      'Accept-Ranges': 'bytes',
-      'Content-Length': apkMeta.sizeBytes,
-      'Cache-Control': 'no-store',
-    });
-    if (method === 'HEAD') {
-      res.end();
+
+    if (url.pathname === '/' || url.pathname === '/index.html') {
+      const html = renderHtmlPage();
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(html),
+        'Cache-Control': 'no-store',
+      });
+      res.end(method === 'HEAD' ? undefined : html);
       return;
     }
-    fs.createReadStream(apkMeta.filePath).pipe(res);
-    return;
-  }
 
-  if (url.pathname === '/' || url.pathname === '/index.html') {
-    const html = renderHtmlPage();
-    res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Content-Length': Buffer.byteLength(html),
-      'Cache-Control': 'no-store',
-    });
-    res.end(method === 'HEAD' ? undefined : html);
-    return;
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not Found');
+  } catch (err) {
+    if (!res.headersSent) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    }
+    if (!res.writableEnded) {
+      res.end('Bad Request');
+    }
   }
+});
 
-  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Not Found');
+server.on('error', (err) => {
+  console.error('Preview server error:', err);
+  process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

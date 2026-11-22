@@ -17,9 +17,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -51,13 +55,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lagradost.cloudstream4.compose.Colors
 import com.lagradost.cloudstream4.compose.SingleSelectDialog
+import com.lagradost.cloudstream4.rememberAppSettings
 import com.lagradost.cloudstream4.theme.CloudStreamPreviewTheme
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.compose.BaseSearchBar
 import com.lagradost.quicknovel.ui.common.SearchList
 import com.lagradost.quicknovel.ui.common.SearchResponseAction
 import com.lagradost.quicknovel.ui.search.SearchRow
-import com.mihon.common.preference.AndroidPreferenceStore
 import com.mihon.presentation.settings.collectAsState
 import kotlinx.coroutines.launch
 
@@ -124,9 +128,8 @@ fun MainPageScreen(state: MainPageState, action: (MainPageAction) -> Unit) {
         }
     }
 
-    val context = LocalContext.current
-    val store = AndroidPreferenceStore(context)
-    val searchIsRow = store.getBoolean(stringResource(R.string.search_list_view_key), false)
+    val settings = rememberAppSettings()
+    val searchIsRow = settings.main.isRow
     val searchIsRowState by searchIsRow.collectAsState()
 
     Scaffold(
@@ -198,31 +201,63 @@ fun MainPageScreen(state: MainPageState, action: (MainPageAction) -> Unit) {
             }
 
             // An extension runtime failure previously left an empty black provider page.
-            // Show the actual error (or a clear empty state) and provide a retry action.
+            // Show the actual error (or a clear empty state) and provide a retry/verify action.
             if (!visibleLoading && visibleItems.isEmpty()) {
-                Column(
+                val context = LocalContext.current
+                val cfChallenge = remember(visibleError) {
+                    com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(visibleError)
+                }
+                Surface(
                     modifier = Modifier
                         .align(Alignment.Center)
                         .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    tonalElevation = 2.dp,
                 ) {
-                    Text(
-                        text = visibleError?.message ?: "No novels found.",
-                        color = MaterialTheme.colorScheme.onBackground,
-                        textAlign = TextAlign.Center,
-                    )
-                    if (visibleError != null) {
-                        Button(
-                            onClick = {
-                                if (state.openQuery) {
-                                    action(MainPageAction.Search(state.query.query))
-                                } else {
-                                    action(MainPageAction.Expand)
+                    Column(
+                        modifier = Modifier.padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = visibleError?.message ?: "No novels found.",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.bodyLarge,
+                            textAlign = TextAlign.Center,
+                        )
+                        if (visibleError != null) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {
+                                        if (state.openQuery) {
+                                            action(MainPageAction.Search(state.query.query))
+                                        } else {
+                                            action(MainPageAction.Expand)
+                                        }
+                                    }
+                                ) {
+                                    Text(stringResource(R.string.reload_error))
+                                }
+                                if (cfChallenge != null) {
+                                    FilledTonalButton(
+                                        onClick = {
+                                            com.lagradost.quicknovel.network.CloudflareChallengeManager.launchVerification(
+                                                context,
+                                                cfChallenge.url,
+                                            ) {
+                                                if (state.openQuery) {
+                                                    action(MainPageAction.Search(state.query.query))
+                                                } else {
+                                                    action(MainPageAction.Refresh)
+                                                }
+                                            }
+                                        }
+                                    ) {
+                                        Text(stringResource(R.string.open_verification))
+                                    }
                                 }
                             }
-                        ) {
-                            Text("Retry")
                         }
                     }
                 }
@@ -231,6 +266,10 @@ fun MainPageScreen(state: MainPageState, action: (MainPageAction) -> Unit) {
             // Keep a pagination failure visible when earlier pages already loaded.
             // Otherwise the grid remains on screen and the failure is only a brief toast.
             if (!state.openQuery && !visibleLoading && visibleItems.isNotEmpty() && visibleError != null) {
+                val context = LocalContext.current
+                val cfChallenge = remember(visibleError) {
+                    com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(visibleError)
+                }
                 Surface(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -247,8 +286,24 @@ fun MainPageScreen(state: MainPageState, action: (MainPageAction) -> Unit) {
                             text = visibleError.message ?: "Could not load more novels.",
                             color = MaterialTheme.colorScheme.onErrorContainer,
                         )
-                        Button(onClick = { action(MainPageAction.Expand) }) {
-                            Text("Retry")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { action(MainPageAction.Expand) }) {
+                                Text("Retry")
+                            }
+                            if (cfChallenge != null) {
+                                androidx.compose.material3.OutlinedButton(
+                                    onClick = {
+                                        com.lagradost.quicknovel.network.CloudflareChallengeManager.launchVerification(
+                                            context,
+                                            cfChallenge.url,
+                                        ) {
+                                            action(MainPageAction.Expand)
+                                        }
+                                    }
+                                ) {
+                                    Text(stringResource(R.string.open_verification))
+                                }
+                            }
                         }
                     }
                 }
@@ -315,19 +370,42 @@ fun SearchResponseDialog(
         }
 
         if (dialog.error != null) {
-            Text(
-                color = MaterialTheme.colorScheme.onBackground,
-                fontSize = 14.sp,
-                lineHeight = 15.sp,
-                text = dialog.error.toString(),
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxSize(),
-            )
+            val context = LocalContext.current
+            val cfChallenge = remember(dialog.error) {
+                com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(dialog.error)
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
+            ) {
+                Text(
+                    color = MaterialTheme.colorScheme.onBackground,
+                    style = MaterialTheme.typography.bodyMedium,
+                    text = dialog.error.message ?: dialog.error.toString(),
+                    textAlign = TextAlign.Center,
+                )
+                if (cfChallenge != null) {
+                    Button(
+                        onClick = {
+                            com.lagradost.quicknovel.network.CloudflareChallengeManager.launchVerification(
+                                context,
+                                cfChallenge.url,
+                            ) {
+                                dismiss()
+                            }
+                        }
+                    ) {
+                        Text(stringResource(R.string.open_verification))
+                    }
+                }
+            }
         } else if (dialog.items.isEmpty()) {
             Text(
                 color = MaterialTheme.colorScheme.onBackground,
-                fontSize = 14.sp,
-                lineHeight = 15.sp,
+                style = MaterialTheme.typography.bodyMedium,
                 text = stringResource(R.string.no_data),
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxSize(),
@@ -355,9 +433,8 @@ fun MainPageSearchBar(
     scrollBehavior: TopAppBarScrollBehavior,
     apiName: String,
 ) {
-    val context = LocalContext.current
-    val store = AndroidPreferenceStore(context)
-    val searchIsRow = store.getBoolean(stringResource(R.string.search_list_view_key), false)
+    val settings = rememberAppSettings()
+    val searchIsRow = settings.main.isRow
     val searchIsRowState by searchIsRow.collectAsState()
 
     BaseSearchBar(
@@ -440,8 +517,9 @@ fun MainPageSearchBar(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 5.dp, start = 5.dp, end = 5.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
+                    .padding(bottom = 6.dp, start = 10.dp, end = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 query.category?.let {
                     SelectButton(it) {
@@ -465,19 +543,31 @@ fun MainPageSearchBar(
 
 @Composable
 fun RowScope.SelectButton(text: String, onClick: () -> Unit) {
-    Button(
+    FilterChip(
+        selected = true,
         onClick = onClick,
-        Modifier
-            .weight(1.0f)
-            .padding(horizontal = 5.dp),
-        colors = Colors.blackButton,
-    ) {
-        Text(text)
-        Spacer(Modifier.width(10.dp))
-        Icon(
-            painter = painterResource(R.drawable.arrow_drop_down_24px), contentDescription = text
-        )
-    }
+        modifier = Modifier.weight(1.0f),
+        shape = RoundedCornerShape(12.dp),
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = MaterialTheme.colorScheme.background,
+            selectedLabelColor = MaterialTheme.colorScheme.onBackground,
+            selectedTrailingIconColor = MaterialTheme.colorScheme.onBackground,
+        ),
+        label = {
+            Text(
+                text = text,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+        },
+        trailingIcon = {
+            Icon(
+                painter = painterResource(R.drawable.arrow_drop_down_24px),
+                contentDescription = text,
+                modifier = Modifier.size(18.dp),
+            )
+        },
+    )
 }
 
 @PreviewLightDark

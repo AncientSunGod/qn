@@ -1,6 +1,7 @@
 package com.lagradost.quicknovel.providers
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.quicknovel.ChapterData
 import com.lagradost.quicknovel.ErrorLoadingException
 import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
@@ -9,11 +10,15 @@ import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.fixUrlNull
+import com.lagradost.quicknovel.network.CloudflareChallengeException
+import com.lagradost.quicknovel.network.CloudflareChallengeManager
+import com.lagradost.quicknovel.network.isCloudflareChallengeResponse
 import com.lagradost.quicknovel.newChapterData
 import com.lagradost.quicknovel.newReview
 import com.lagradost.quicknovel.newSearchResponse
 import com.lagradost.quicknovel.newStreamResponse
 import com.lagradost.quicknovel.setStatus
+import com.lagradost.quicknovel.util.AppUtils.parseJson
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -30,6 +35,16 @@ private fun escapeHtmlText(text: String): String =
 
 private fun escapeHtmlAttr(text: String): String =
     escapeHtmlText(text).replace("'", "&#39;")
+
+private fun isFenrirVerificationHtml(text: String): Boolean {
+    val lower = text.lowercase()
+    return lower.contains("verifying access") ||
+        lower.contains("confirm you're human") ||
+        lower.contains("confirm you’re human") ||
+        lower.contains("cf-turnstile") ||
+        lower.contains("challenges.cloudflare.com") ||
+        lower.contains("just a moment")
+}
 
 private fun renderFenrirTipTapNode(node: JSONObject): String {
     val type = node.optString("type")
@@ -95,13 +110,14 @@ internal fun renderFenrirTipTapDocToHtml(raw: String): String? {
 
 internal fun sanitizeFenrirChapterHtml(rawHtml: String): String? {
     if (rawHtml.isBlank()) return null
+    if (isFenrirVerificationHtml(rawHtml)) return null
     val doc = Jsoup.parseBodyFragment(rawHtml)
     doc.select("script, style, iframe, svg, noscript, [aria-hidden=\"true\"], .reader-attribution, [data-fr-attr]")
         .remove()
     val cleaned = doc.body().html()
         .replace(FENRIR_ZERO_WIDTH_REGEX, "")
         .trim()
-    return cleaned.takeIf { it.isNotBlank() }
+    return cleaned.takeIf { it.isNotBlank() && !isFenrirVerificationHtml(cleaned) }
 }
 
 internal fun parseFenrirApiChapterJson(rawJson: String): String? {
@@ -109,6 +125,7 @@ internal fun parseFenrirApiChapterJson(rawJson: String): String? {
     val content = obj.optString("content").trim()
     if (content.isBlank()) return null
     val format = obj.optString("content_format").lowercase()
+    if (format == "locked") return null
     return when {
         format == "tiptap" || content.startsWith("{") -> {
             renderFenrirTipTapDocToHtml(content) ?: sanitizeFenrirChapterHtml(content)
@@ -151,7 +168,54 @@ internal fun parseFenrirHtmlChapterPage(document: Document): String? {
     return sanitizeFenrirChapterHtml(container.html())
 }
 
-class FenrirRealProvider : MainAPI() {
+internal fun parseFenrirChaptersJson(rawText: String, cleanSeriesUrl: String): List<ChapterData> {
+    val trimmed = rawText.trim()
+    if (trimmed.isBlank()) return emptyList()
+    val items: List<FenrirRealProvider.ChapterInf> = if (trimmed.startsWith("[")) {
+        runCatching { parseJson<List<FenrirRealProvider.ChapterInf>>(trimmed) }.getOrDefault(emptyList())
+    } else {
+        val obj = runCatching { JSONObject(trimmed) }.getOrNull()
+        val dataArr = obj?.optJSONArray("data")?.toString()
+        if (dataArr != null) {
+            runCatching { parseJson<List<FenrirRealProvider.ChapterInf>>(dataArr) }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+    }
+
+    return items.mapNotNull { ch ->
+        if ((ch.locked?.price ?: 0) > 0) return@mapNotNull null
+        val slug = ch.slug?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+        val groupSlug = ch.group?.slug?.trim()?.takeIf { it.isNotEmpty() }
+        val displayName = buildString {
+            val base = ch.name?.trim()?.takeIf { it.isNotEmpty() }
+                ?: ch.number?.let { num ->
+                    if (num % 1.0 == 0.0) "Chapter ${num.toLong()}" else "Chapter $num"
+                }
+            if (base != null) append(base)
+            val sub = ch.title?.trim()?.takeIf { it.isNotEmpty() }
+            if (sub != null) {
+                if (isNotEmpty()) append(" - ")
+                append(sub)
+            }
+        }.ifBlank { slug }
+
+        val pathPart = if (groupSlug != null) "$groupSlug/$slug" else slug
+        val apiRef = ch.uuid?.trim()?.takeIf { it.isNotEmpty() } ?: ch.id?.toString()
+        val chapterUrl = if (apiRef != null) {
+            "$cleanSeriesUrl/$pathPart~~$apiRef"
+        } else {
+            "$cleanSeriesUrl/$pathPart"
+        }
+        ChapterData(
+            name = displayName,
+            url = chapterUrl,
+            dateOfRelease = ch.updatedAt?.split("T")?.firstOrNull(),
+        )
+    }
+}
+
+object FenrirRealProvider : MainAPI() {
     override val name = "FenrirRealm"
     override val mainUrl = "https://fenrirealm.com"
     override val iconId = R.drawable.icon_fenrirealm
@@ -212,7 +276,25 @@ class FenrirRealProvider : MainAPI() {
     )
 
     fun String.getSlugFromUrl(): String =
-        this.trimEnd('/').substringAfter("/series/")
+        this.trimEnd('/').substringAfter("/series/").substringBefore("/")
+
+    private fun checkVerificationResponse(statusCode: Int, body: String, url: String) {
+        if (statusCode == 403 || isFenrirVerificationHtml(body) || isCloudflareChallengeResponse(
+                statusCode = statusCode,
+                cfRay = null,
+                server = null,
+                cfMitigated = null,
+                location = null,
+                bodySample = body.take(8192),
+            )
+        ) {
+            throw CloudflareChallengeException(
+                url = url,
+                host = "fenrirealm.com",
+                message = "Fenrir Realm requires browser verification. Tap 'Open verification' to complete Turnstile and retry.",
+            )
+        }
+    }
 
     override suspend fun loadMainPage(
         page: Int,
@@ -220,17 +302,21 @@ class FenrirRealProvider : MainAPI() {
         orderBy: String?,
         tag: String?
     ): HeadMainPageResponse {
-        val safeTag = tag ?: "0"
-        val safeCat = mainCategory ?: "any"
-        val safeSort = orderBy ?: "popular"
+        val safeTag = tag?.takeIf { it.isNotBlank() } ?: "0"
+        val safeCat = mainCategory?.takeIf { it.isNotBlank() } ?: "any"
+        val safeSort = orderBy?.takeIf { it.isNotBlank() } ?: "popular"
         val url =
             if (safeTag != "0") "$mainUrl/api/new/v2/series?page=$page&per_page=12&status=$safeCat&sort=$safeSort&tags%5B%5D=$safeTag"
             else "$mainUrl/api/new/v2/series?page=$page&per_page=24&status=$safeCat&sort=$safeSort"
-        val document = app.get(url).parsed<FenrirMainPageResponse>()
-        val returnValue = document.data.map { novel ->
+        val response = app.get(url)
+        checkVerificationResponse(response.code, response.text, "$mainUrl/")
+        val document = parseJson<FenrirMainPageResponse>(response.text)
+        val returnValue = document.data.mapNotNull { novel ->
+            val title = novel.title?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val slug = novel.slug?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
             newSearchResponse(
-                name = novel.title,
-                url = "$mainUrl/series/${novel.slug}"
+                name = title,
+                url = "$mainUrl/series/$slug"
             ) {
                 posterUrl = fixUrlNull(novel.cover)
             }
@@ -239,14 +325,16 @@ class FenrirRealProvider : MainAPI() {
     }
 
     suspend fun getRelated(url: String): List<SearchResponse> {
-        val name = url.trimEnd('/').substringAfter("/series/")
+        val name = url.getSlugFromUrl().takeIf { it.isNotBlank() } ?: return emptyList()
         val relatedUrl = "$mainUrl/api/new/v2/series/$name/recommendations?limit=10"
-        val document = runCatching { app.get(relatedUrl).parsed<FenrirMainPageResponse>() }.getOrNull()
+        val document = runCatching { app.get(relatedUrl).parsedSafe<FenrirMainPageResponse>() }.getOrNull()
             ?: return emptyList()
-        return document.data.map { element ->
-            val href = "$mainUrl/series/${element.slug}"
+        return document.data.mapNotNull { element ->
+            val title = element.title?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val slug = element.slug?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val href = "$mainUrl/series/$slug"
             newSearchResponse(
-                name = element.title,
+                name = title,
                 url = href
             ) {
                 posterUrl = fixUrlNull(element.cover)
@@ -255,40 +343,20 @@ class FenrirRealProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val cleanUrl = url.trimEnd('/')
-        val document = app.get(cleanUrl).document
+        val cleanUrl = url.substringBefore("?").substringBefore("#").trimEnd('/')
+        val pageRes = app.get(cleanUrl)
+        checkVerificationResponse(pageRes.code, pageRes.text, cleanUrl)
+        val document = pageRes.document
         document.select("style, iframe, svg, noscript").remove()
         val infoDiv = document.select("div#series-info")
         val seriesSlug = cleanUrl.getSlugFromUrl()
-        val chapters = app
-            .get("$mainUrl/api/new/v2/series/$seriesSlug/chapters")
-            .parsed<Array<ChapterInf>>()
-            .mapNotNull { ch ->
-                if ((ch.locked?.price ?: 0) > 0) null
-                else {
-                    val displayName = buildString {
-                        val base = ch.name?.trim()?.takeIf { it.isNotEmpty() }
-                            ?: ch.number?.let { "Chapter $it" }
-                        if (base != null) append(base)
-                        val sub = ch.title?.trim()?.takeIf { it.isNotEmpty() }
-                        if (sub != null) {
-                            if (isNotEmpty()) append(" - ")
-                            append(sub)
-                        }
-                    }.ifBlank { ch.slug }
-                    val chapterUrl = if (ch.id != null) {
-                        "$cleanUrl/${ch.slug}~~${ch.id}"
-                    } else {
-                        "$cleanUrl/${ch.slug}/__data.json?x-sveltekit-invalidated=10001"
-                    }
-                    newChapterData(displayName, chapterUrl) {
-                        dateOfRelease = ch.updatedAt?.split("T")?.firstOrNull()
-                    }
-                }
-            }
+        val chaptersResponse = app.get("$mainUrl/api/new/v2/series/$seriesSlug/chapters")
+        checkVerificationResponse(chaptersResponse.code, chaptersResponse.text, cleanUrl)
+        val chapters = parseFenrirChaptersJson(chaptersResponse.text, cleanUrl)
 
-        val title = infoDiv.selectFirst("h1")?.text()
-            ?: document.selectFirst("h1")?.text()
+        val title = infoDiv.selectFirst("h1")?.text()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: document.selectFirst("h1")?.text()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()?.takeIf { it.isNotEmpty() }
             ?: throw ErrorLoadingException("Title not found")
         val script =
             document.select("script").find { it.html().contains("seriesData") }?.html() ?: ""
@@ -307,68 +375,126 @@ class FenrirRealProvider : MainAPI() {
             }
             if (this.synopsis.isNullOrBlank()) {
                 this.synopsis = document.selectFirst("div.synopsis")?.text()
+                    ?: document.selectFirst("meta[property=og:description]")?.attr("content")
             }
             this.posterUrl = document.selectFirst("meta[property=og:image]")?.attr("content")
-            related = getRelated(cleanUrl)
-            reviewData = Regex("""seriesData:\{id:(\d+)""").find(script)?.groupValues?.get(1)
+                ?.let { fixUrlNull(it) }
+            related = runCatching { getRelated(cleanUrl) }.getOrDefault(emptyList())
+            reviewData = Regex("""seriesData:\s*\{\s*id:\s*(\d+)""").find(script)?.groupValues?.getOrNull(1)
         }
     }
 
     override suspend fun loadReviews(url: String, page: Int, data: String?): List<UserReview> {
         val libraryId = data ?: return emptyList()
         val realUrl = "$mainUrl/api/new/v2/comments/series/$libraryId?page=$page&sort=latest"
-        val res = app.get(realUrl).parsed<CommentsResponse>()
-        return res.data.map { comment ->
-            newReview(comment.content) {
-                username = comment.user.username
-                date = comment.createdAt.split("T").firstOrNull()
-                avatarUrl = comment.user.avatar
+        val res = runCatching { app.get(realUrl).parsedSafe<CommentsResponse>() }.getOrNull() ?: return emptyList()
+        return res.data.mapNotNull { comment ->
+            val text = comment.content?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            newReview(text) {
+                username = comment.user?.username ?: "User"
+                date = comment.createdAt?.split("T")?.firstOrNull()
+                avatarUrl = fixUrlNull(comment.user?.avatar)
             }
         }
     }
 
     override suspend fun loadHtml(url: String): String {
-        val chapterId = Regex("""~~(\d+)$""").find(url)?.groupValues?.getOrNull(1)
+        val chapterRef = Regex("""~~([A-Za-z0-9-]+)$""").find(url)?.groupValues?.getOrNull(1)
         val baseChapterUrl = url.substringBefore("~~").substringBefore("/__data.json")
+        var sawChallenge = false
 
-        if (chapterId != null) {
-            val apiJson = runCatching {
+        // 1. Acquire short-lived read token if available so API chapter fetches carry session state
+        runCatching {
+            app.get("$mainUrl/api/read-token", headers = mapOf("Referer" to baseChapterUrl))
+        }
+
+        // 2. Try chapter REST API (/api/new/v2/chapters/{uuid-or-id})
+        if (chapterRef != null) {
+            val apiRes = runCatching {
                 app.get(
-                    "$mainUrl/api/new/v2/chapters/$chapterId",
-                    headers = mapOf("Accept" to "application/json")
-                ).text
-            }.getOrNull()
-            if (apiJson != null) {
-                parseFenrirApiChapterJson(apiJson)?.let { return it }
+                    "$mainUrl/api/new/v2/chapters/$chapterRef",
+                    headers = mapOf(
+                        "Accept" to "application/json",
+                        "Referer" to baseChapterUrl,
+                    ),
+                )
+            }.getOrElse { error ->
+                if (CloudflareChallengeManager.findCloudflareChallenge(error) != null) throw error
+                null
+            }
+            if (apiRes != null) {
+                if (apiRes.code == 403 || isFenrirVerificationHtml(apiRes.text)) {
+                    sawChallenge = true
+                } else {
+                    val parsedObj = runCatching { JSONObject(apiRes.text) }.getOrNull()
+                    val format = parsedObj?.optString("content_format").orEmpty().lowercase()
+                    if (format == "locked" || apiRes.text.contains("Verifying access", true)) {
+                        sawChallenge = true
+                    } else {
+                        parseFenrirApiChapterJson(apiRes.text)?.let { return it }
+                    }
+                }
             }
         }
 
+        // 3. Try SvelteKit __data.json
         val dataUrl = if (url.contains("__data.json")) {
             url
         } else {
             "$baseChapterUrl/__data.json?x-sveltekit-invalidated=10001"
         }
-        val svelteJson = runCatching { app.get(dataUrl).text }.getOrNull()
-        if (svelteJson != null) {
-            parseFenrirSvelteKitChapterData(svelteJson)?.let { return it }
+        val svelteRes = runCatching {
+            app.get(dataUrl, headers = mapOf("Referer" to baseChapterUrl))
+        }.getOrElse { error ->
+            if (CloudflareChallengeManager.findCloudflareChallenge(error) != null) throw error
+            null
+        }
+        if (svelteRes != null) {
+            if (svelteRes.code == 403 || isFenrirVerificationHtml(svelteRes.text)) {
+                sawChallenge = true
+            } else {
+                parseFenrirSvelteKitChapterData(svelteRes.text)?.let { return it }
+            }
         }
 
-        val htmlDoc = runCatching { app.get(baseChapterUrl).document }.getOrNull()
-        if (htmlDoc != null) {
-            parseFenrirHtmlChapterPage(htmlDoc)?.let { return it }
+        // 4. Fallback to rendered HTML chapter page
+        val htmlRes = runCatching {
+            app.get(baseChapterUrl, headers = mapOf("Referer" to mainUrl))
+        }.getOrElse { error ->
+            if (CloudflareChallengeManager.findCloudflareChallenge(error) != null) throw error
+            null
+        }
+        if (htmlRes != null) {
+            if (htmlRes.code == 403 || isFenrirVerificationHtml(htmlRes.text)) {
+                sawChallenge = true
+            } else {
+                parseFenrirHtmlChapterPage(htmlRes.document)?.let { return it }
+            }
         }
 
-        throw ErrorLoadingException("Cant' access to chapter: $url")
+        if (sawChallenge) {
+            throw CloudflareChallengeException(
+                url = baseChapterUrl,
+                host = "fenrirealm.com",
+                message = "Fenrir Realm requires Turnstile verification to read this chapter. Tap 'Verify in browser' to continue.",
+            )
+        }
+
+        throw ErrorLoadingException("Could not load Fenrir Realm chapter: $baseChapterUrl")
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query.trim(), "UTF-8")
-        val url = "$mainUrl/api/new/v2/series?page=1&per_page=10&search=$encoded"
-        val document = app.get(url).parsed<FenrirMainPageResponse>()
+        val url = "$mainUrl/api/new/v2/series?page=1&per_page=24&search=$encoded"
+        val response = app.get(url)
+        checkVerificationResponse(response.code, response.text, "$mainUrl/")
+        val document = parseJson<FenrirMainPageResponse>(response.text)
 
-        return document.data.map { novel ->
-            val novelUrl = "$mainUrl/series/${novel.slug}"
-            newSearchResponse(novel.title, novelUrl) {
+        return document.data.mapNotNull { novel ->
+            val title = novel.title?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val slug = novel.slug?.trim()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val novelUrl = "$mainUrl/series/$slug"
+            newSearchResponse(title, novelUrl) {
                 posterUrl = fixUrlNull(novel.cover)
             }
         }
@@ -381,18 +507,27 @@ class FenrirRealProvider : MainAPI() {
 
     data class Daum(
         @JsonProperty("title")
-        val title: String,
+        val title: String? = null,
         @JsonProperty("slug")
-        val slug: String,
+        val slug: String? = null,
         @JsonProperty("cover")
         val cover: String? = null,
+    )
+
+    data class ChapterGroup(
+        @JsonProperty("slug")
+        val slug: String? = null,
+        @JsonProperty("index")
+        val index: Int? = null,
     )
 
     data class ChapterInf(
         @JsonProperty("id")
         val id: Long? = null,
+        @JsonProperty("uuid")
+        val uuid: String? = null,
         @JsonProperty("slug")
-        val slug: String,
+        val slug: String? = null,
         @JsonProperty("number")
         val number: Double? = null,
         @JsonProperty("name")
@@ -403,11 +538,13 @@ class FenrirRealProvider : MainAPI() {
         val updatedAt: String? = null,
         @JsonProperty("locked")
         val locked: Locked? = null,
+        @JsonProperty("group")
+        val group: ChapterGroup? = null,
     )
 
     data class Locked(
         @JsonProperty("price")
-        val price: Int = 0,
+        val price: Int? = 0,
     )
 
     data class CommentsResponse(
@@ -417,17 +554,17 @@ class FenrirRealProvider : MainAPI() {
 
     data class CommentData(
         @JsonProperty("content")
-        val content: String,
+        val content: String? = null,
         @JsonProperty("created_at")
-        val createdAt: String,
+        val createdAt: String? = null,
         @JsonProperty("user")
-        val user: CommentUser
+        val user: CommentUser? = null
     )
 
     data class CommentUser(
         @JsonProperty("username")
-        val username: String,
+        val username: String? = null,
         @JsonProperty("avatar")
-        val avatar: String?
+        val avatar: String? = null
     )
 }

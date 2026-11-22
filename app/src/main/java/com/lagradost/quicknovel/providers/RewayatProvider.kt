@@ -1,6 +1,5 @@
 package com.lagradost.quicknovel.providers
 
-import android.net.Uri
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.quicknovel.ChapterData
@@ -8,7 +7,6 @@ import com.lagradost.quicknovel.ErrorLoadingException
 import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
-import com.lagradost.quicknovel.MainActivity.Companion.app
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.fixUrl
@@ -18,7 +16,7 @@ import com.lagradost.quicknovel.newStreamResponse
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
-class RewayatProvider():  MainAPI() {
+object RewayatProvider:  MainAPI() {
     override val name = "Rewayat"
     override val mainUrl = "https://rewayat.club"
     private val secondUrl = "https://api.rewayat.club"
@@ -78,7 +76,9 @@ class RewayatProvider():  MainAPI() {
         tag: String?
     ): HeadMainPageResponse
     {
-        val url = "$mainUrl/library?type=$mainCategory&ordering=$orderBy${if(!tag.isNullOrEmpty()) "&genre=$tag" else ""}&page=$page"
+        val safeType = mainCategory?.takeIf { it.isNotBlank() } ?: "0"
+        val safeOrder = orderBy?.takeIf { it.isNotBlank() } ?: "num_chapters"
+        val url = "$mainUrl/library?type=$safeType&ordering=$safeOrder${if(!tag.isNullOrEmpty()) "&genre=$tag" else ""}&page=$page"
         val document = app.get(url).document
 
         val imgUrls = getListOfPosters(document)
@@ -131,9 +131,9 @@ class RewayatProvider():  MainAPI() {
         val title = infoDiv.selectFirst("h1 > span")?.text() ?: throw ErrorLoadingException("No title")
 
         val chapters = getChapters(document, url)
-        val imgUrls = getListOfPosters(document)[0]
+        val imgUrl = getListOfPosters(document).firstOrNull()
         return newStreamResponse(title,fixUrl(url), chapters) {
-            this.posterUrl = imgUrls
+            this.posterUrl = imgUrl
             this.synopsis = infoDiv.selectFirst("div.text-body-2.font-weight-medium.font-dense.font-cairo.mb-6.text-pre-line span")?.text() ?: ""
         }
     }
@@ -171,8 +171,8 @@ class RewayatProvider():  MainAPI() {
         }
 
         val baseUrl = chapterData[0]
-        val chapterBigIndex = chapterData[1].toInt()
-        val totalChapters = chapterData[2].toInt()
+        val chapterBigIndex = chapterData.getOrNull(1)?.toIntOrNull() ?: return null
+        val totalChapters = chapterData.getOrNull(2)?.toIntOrNull()?.takeIf { it > 0 } ?: return null
         val itemsPerPage = 24
 
         val remainder = totalChapters % itemsPerPage
@@ -192,7 +192,7 @@ class RewayatProvider():  MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/api/novels/search/all/?search=${Uri.encode(query)}"
+        val url = "$mainUrl/api/novels/search/all/?search=${java.net.URLEncoder.encode(query.trim(), "UTF-8")}"
         val document = app.get(url).parsed<RewayatSearchResponse>()
         return document.results.map { element ->
             val title = element.english

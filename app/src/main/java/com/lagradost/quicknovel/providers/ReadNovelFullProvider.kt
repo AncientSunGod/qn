@@ -1,7 +1,17 @@
 package com.lagradost.quicknovel.providers
 
-import com.lagradost.quicknovel.*
-import com.lagradost.quicknovel.MainActivity.Companion.app
+import com.lagradost.quicknovel.ErrorLoadingException
+import com.lagradost.quicknovel.LoadResponse
+import com.lagradost.quicknovel.MainAPI
+import com.lagradost.quicknovel.Score
+import com.lagradost.quicknovel.SearchResponse
+import com.lagradost.quicknovel.USER_AGENT
+import com.lagradost.quicknovel.fixUrlNull
+import com.lagradost.quicknovel.newChapterData
+import com.lagradost.quicknovel.newSearchResponse
+import com.lagradost.quicknovel.newStreamResponse
+import com.lagradost.quicknovel.setStatus
+import com.lagradost.quicknovel.textClean
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
@@ -11,13 +21,14 @@ import org.jsoup.nodes.Element
     override val ajaxUrl = "ajax/chapter-archive"
 }*/
 
-class ReadNovelFullProvider : MainAPI() {
+object ReadNovelFullProvider : MainAPI() {
     override val mainUrl = "https://readnovelfull.com"
     override val name = "ReadNovelFull"
 
     override suspend fun search(query: String): List<SearchResponse> {
+        val encoded = java.net.URLEncoder.encode(query.trim(), "UTF-8")
         val document = app.get(
-            "$mainUrl/novel-list/search?keyword=$query",
+            "$mainUrl/novel-list/search?keyword=$encoded",
             headers = mapOf("User-Agent" to USER_AGENT)
         ).document
 
@@ -25,11 +36,12 @@ class ReadNovelFullProvider : MainAPI() {
 
         return headers.mapNotNull { h ->
             val divs = h.select("> div > div")
-            val poster = divs[0].selectFirst("> img")?.attr("src")?.replace("t-200x89", "t-300x439")
-            val titleHeader = divs[1].selectFirst("> h3.novel-title > a")
-            val href = titleHeader?.attr("href")
-            val title = titleHeader?.text()
-            //val latestChapter = divs[2].selectFirst("> a > span")?.text()
+            val poster = divs.getOrNull(0)?.selectFirst("> img")?.attr("src")
+                ?.replace("t-200x89", "t-300x439")
+            val titleHeader = divs.getOrNull(1)?.selectFirst("> h3.novel-title > a")
+            val href = titleHeader?.attr("href")?.takeIf { it.isNotBlank() }
+            val title = titleHeader?.text()?.takeIf { it.isNotBlank() }
+            //val latestChapter = divs.getOrNull(2)?.selectFirst("> a > span")?.text()
             newSearchResponse(
                 name = title ?: return@mapNotNull null,
                 url = href ?: return@mapNotNull null
@@ -40,15 +52,13 @@ class ReadNovelFullProvider : MainAPI() {
     }
 
     override suspend fun loadHtml(url: String): String? {
-        val response = app.get(url)
-        val document = Jsoup.parse(response.text)
+        val document = app.get(url).document
         return document.selectFirst("div#chr-content")
             ?.html().textClean?.replace("[Updated from F r e e w e b n o v e l. c o m]", "")
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val response = app.get(url)
-        val document = Jsoup.parse(response.text)
+        val document = app.get(url).document
 
         val header = document.selectFirst("div.col-info-desc")
         val bookInfo = header?.selectFirst("> div.info-holder > div.books")
@@ -75,15 +85,13 @@ class ReadNovelFullProvider : MainAPI() {
         }
 
         val dataUrl = "$mainUrl/ajax/chapter-archive?novelId=$novelId"
-        val dataResponse = app.get(dataUrl)
-        val dataDocument =
-            Jsoup.parse(dataResponse.text) ?: throw ErrorLoadingException("invalid dataDocument")
+        val dataDocument = app.get(dataUrl).document
         val items =
             dataDocument.select("div.panel-body > div.row > div > ul.list-chapter > li > a")
                 .mapNotNull {
                     newChapterData(
                         name = it.selectFirst("> span")?.text() ?: return@mapNotNull null,
-                        url = it.attr("href") ?: return@mapNotNull null,
+                        url = it.attr("href"),
                     )
                 }
         return newStreamResponse(
@@ -96,10 +104,9 @@ class ReadNovelFullProvider : MainAPI() {
             val statusText = getData("Status:")?.selectFirst("> a")?.text()
             setStatus(statusText)
             synopsis = document.selectFirst("div.desc-text")?.text()
-            rating = rate.selectFirst("> input")?.attr("value")?.toFloatOrNull()?.times(100)
-                ?.toInt()
+            score = Score.from10(rate.selectFirst("> input")?.attr("value"))
             peopleVoted =
-                rateInfo.select("> div.small > em > strong > span")?.last()?.text()?.toIntOrNull()
+                rateInfo.select("> div.small > em > strong > span").last()?.text()?.toIntOrNull()
             posterUrl = bookInfo.selectFirst("> div.book > img")?.attr("src")
         }
     }

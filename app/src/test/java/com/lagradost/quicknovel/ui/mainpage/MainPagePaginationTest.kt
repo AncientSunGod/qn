@@ -13,7 +13,8 @@ class MainPagePaginationTest {
         url = "https://example.com/novel/$id",
         apiName = "Test",
         timeOfCached = 0L,
-        chaptersRead = 0,
+        lastChaptersRead = 0,
+        chaptersRead = null,
     )
 
     @Test

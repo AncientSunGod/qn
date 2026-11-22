@@ -127,12 +127,14 @@ class WebViewResolver(
         referer: String? = null,
         method: String = "GET",
         completionStabilityDelay: kotlin.time.Duration = 5.seconds,
+        maxTimeout: kotlin.time.Duration = 60.seconds,
         requestCallBack: (Request) -> Boolean = { false },
     ): Pair<Request?, List<Request>> {
         val result = resolveUsingWebView(
             request = requestCreator(method, url, referer = referer),
             requestCallBack = requestCallBack,
             completionStabilityDelay = completionStabilityDelay,
+            maxTimeout = maxTimeout,
         )
         return (result.first as? Request) to result.second
     }
@@ -147,6 +149,7 @@ class WebViewResolver(
         request: Request,
         requestCallBack: (Request) -> Boolean = { false },
         completionStabilityDelay: kotlin.time.Duration = 5.seconds,
+        maxTimeout: kotlin.time.Duration = 60.seconds,
     ): Pair<Any?, List<Request>> {
         val url = request.url.toString()
         val headers = request.headers
@@ -351,8 +354,8 @@ class WebViewResolver(
             }
         }
 
-        // Wait for the WebView to finish (max 60 seconds)
-        val result = withTimeoutOrNull(60.seconds) {
+        // Wait for the WebView to finish (bounded by maxTimeout)
+        val result = withTimeoutOrNull(maxTimeout) {
             deferredResponse.await()
         }
 

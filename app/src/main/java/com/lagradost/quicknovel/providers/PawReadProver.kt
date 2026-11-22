@@ -6,6 +6,7 @@ import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.fixUrlNull
@@ -16,7 +17,7 @@ import com.lagradost.quicknovel.newStreamResponse
 import org.jsoup.nodes.Document
 import kotlin.math.roundToInt
 
-class PawReadProver : MainAPI() {
+object PawReadProver : MainAPI() {
     override val name = "PawRead"
     override val mainUrl = "https://pawread.com"
     override val iconId = R.drawable.pawread
@@ -91,11 +92,12 @@ class PawReadProver : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search/?keywords=$query"
+        val encoded = java.net.URLEncoder.encode(query.trim(), "UTF-8")
+        val url = "$mainUrl/search/?keywords=$encoded"
         val document = app.get(url).document
         return document.select(".list-comic-thumbnail").mapNotNull { select ->
             val node = select.selectFirst(".caption>h3>a") ?: return@mapNotNull null
-            val href = node.attr("href") ?: return@mapNotNull null
+            val href = node.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             newSearchResponse(
                 name = node.text(),
                 url = href
@@ -108,25 +110,31 @@ class PawReadProver : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         //val comic = document.selectFirst(".comic-view")
-        val board = document.selectFirst("#tab1_board")!!
+        val board = document.selectFirst("#tab1_board")
+            ?: throw ErrorLoadingException("Could not load novel details")
+        val title = board.selectFirst("div>h1")?.text()
+            ?: document.selectFirst("h1")?.text()
+            ?: throw ErrorLoadingException("No title")
         val regex = Regex("'(\\d+)'")
-        val prefix = "$url/".replace("//", "/")
+        val prefix = "${url.trimEnd('/')}/"
         return newStreamResponse(
-            name = board.selectFirst("div>h1")!!.text(),
+            name = title,
             url = url,
             data = document.select(".item-box").filter { select ->
                 select.selectFirst("div>svg") == null
-            }.map { select ->
+            }.mapNotNull { select ->
+                val cTitle = select.selectFirst("div>span.c_title")?.text() ?: return@mapNotNull null
+                val cId = regex.find(select.attr("onclick"))?.groupValues?.getOrNull(1)
+                    ?: return@mapNotNull null
                 newChapterData(
-                    name = select.selectFirst("div>span.c_title")!!.text(),
-                    url = "$prefix${regex.find(select.attr("onclick"))!!.groupValues[1]}.html"
+                    name = cTitle,
+                    url = "$prefix$cId.html"
                 )
             }) {
             val info = document.select("#views_info>div")
-            views = info[1].text().trim().removeSuffix("Views").trimEnd().toIntOrNull()
-            author = info[3].text()
-            rating = document.select(".comic-score>span").getOrNull(1)?.text()?.toFloatOrNull()
-                ?.times(1000.0 / 5.0)?.roundToInt()
+            views = info.getOrNull(1)?.text()?.trim()?.removeSuffix("Views")?.trimEnd()?.toIntOrNull()
+            author = info.getOrNull(3)?.text()
+            score = Score.from5(document.select(".comic-score>span").getOrNull(1)?.text())
             peopleVoted = document.selectFirst("#scoreCount")?.text()?.toIntOrNull()
             tags = document.select("div.col-md-9 > div.mt20 > a.btn")
                 .map { it.text().trim().removePrefix("#").trim() }
@@ -136,7 +144,7 @@ class PawReadProver : MainAPI() {
                 fixUrlNull(
                     Regex("image:url\\((.*)\\)").find(
                         attr?.attr("style") ?: ""
-                    )?.groupValues?.get(1)
+                    )?.groupValues?.getOrNull(1)
                 )
             related = getRelated(document)
             reviewData = document.selectFirst("input[name=novel_id]")?.attr("value")
@@ -175,19 +183,19 @@ class PawReadProver : MainAPI() {
                 username = item.user?.username
                 date = item.createdAt
                 avatarUrl = item.user?.avatar
-                rating = item.rating?.times(200)
+                score = Score.from5(item.rating)
             }
         }
     }
 
-    override suspend fun loadHtml(url: String): String? {
+    override suspend fun loadHtml(url: String): String {
         val document = app.get(url).document
         val count = document.selectFirst("#countdown")
         if (count != null) {
             throw ErrorLoadingException("Not released, time until released ${count.text()}")
         }
-        val html = document.selectFirst("#chapter_item")!!.html()
-        return html
+        return document.selectFirst("#chapter_item")?.html()
+            ?: throw ErrorLoadingException("Could not load chapter content")
     }
 
     data class PawReadReviewsResponse(

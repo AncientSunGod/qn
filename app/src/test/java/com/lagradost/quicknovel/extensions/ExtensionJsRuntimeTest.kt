@@ -1290,4 +1290,157 @@ class ExtensionJsRuntimeTest {
         }
     }
 
+    @Test
+    fun normalizesFenrirEs6UnicodeRegexDivisionAndTemplateLiterals() {
+        val fenrirSnippet = """
+            var invisibleRx = /[\u200B-\u200D\uFEFF\u200E\u200F\u202A-\u202E\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
+            var dynamicRx = new RegExp('foo\\s+bar', 'giu');
+            var division = 100 / 5 / 2;
+            var literalStr = '/[\\u{E0000}]/gu';
+            module.exports = {
+              searchNovels: function(q) {
+                var cleaned = 'Hello\u200B\uDB40\uDC20World\uDB40\uDD01!'.replace(invisibleRx, '');
+                var tpl = 'div=' + division + ';match=' + dynamicRx.test('FOO   BAR') + ';str=' + literalStr;
+                return [{ name: cleaned, path: tpl }];
+              }
+            };
+        """.trimIndent()
+        val (extension, file) = extension(fenrirSnippet)
+        try {
+            val result = ExtensionJsRuntime.execute(extension, "searchNovels", "[\"test\"]").getOrThrow()
+            val item = JSONArray(result.json).getJSONObject(0)
+            assertEquals("HelloWorld!", item.getString("name"))
+            assertEquals("div=10;match=true;str=/[\\u{E0000}]/gu", item.getString("path"))
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun supportsFetchViaWebviewBridgeAndEnforcesApprovedHosts() {
+        val pluginCode = """
+            var fetchLib = require('@libs/fetch');
+            module.exports = {
+              parseChapter: function(path) {
+                return fetchLib.fetchViaWebview('https://fenrirrealm.com/' + path, {
+                  waitForSelector: '.chapter-content',
+                  timeoutMs: 12000,
+                  settleMs: 350
+                }).then(function(res) {
+                  return res && res.ok ? res.html : '';
+                });
+              },
+              searchNovels: function() {
+                var unapprovedHost = 'unapproved.invalid';
+                return fetchLib.fetchViaWebview('https://' + unapprovedHost + '/page', {});
+              }
+            };
+        """.trimIndent()
+        val (extension, file) = extension(pluginCode)
+        try {
+            val chapter = ExtensionJsRuntime.execute(
+                extension = extension.copy(site = "https://fenrirrealm.com"),
+                operation = "parseChapter",
+                argumentsJson = """["series/test/chapter-1"]""",
+                testWebviewOverride = { url, selector, timeoutMs, settleMs ->
+                    assertEquals("https://fenrirrealm.com/series/test/chapter-1", url)
+                    assertEquals(".chapter-content", selector)
+                    assertEquals(12000L, timeoutMs)
+                    assertEquals(350L, settleMs)
+                    "<div class=\"chapter-content\"><p>Loaded via WebView</p></div>"
+                },
+            ).getOrThrow()
+            assertTrue(chapter.json.contains("Loaded via WebView"))
+
+            val blocked = ExtensionJsRuntime.execute(
+                extension = extension.copy(site = "https://fenrirrealm.com"),
+                operation = "searchNovels",
+                argumentsJson = "[]",
+                testWebviewOverride = { _, _, _, _ -> "<p>should not reach</p>" },
+            ).getOrThrow()
+            assertTrue(blocked.json.contains("\"ok\":false"))
+            assertTrue(blocked.json.contains("outside the approved extension site"))
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun supportsWtrLabWebModeAesDecryptionWithManyNextChunksAndGoogleTranslate() {
+        val source = javaClass.getResourceAsStream("/lnreader/wtrlab.js")!!
+            .bufferedReader()
+            .use { it.readText() }
+        val (extension, file) = extension(source)
+
+        // Encrypt chapter JSON lines with the exact AES-256-GCM envelope WTR-Lab v1.2.6 decodes.
+        val aesKey = "0123456789abcdef0123456789abcdef"
+        val iv = ByteArray(12) { (it + 1).toByte() }
+        val plaintext = """["Paragraph one.","Paragraph two."]""".toByteArray(Charsets.UTF_8)
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            javax.crypto.Cipher.ENCRYPT_MODE,
+            javax.crypto.spec.SecretKeySpec(aesKey.toByteArray(Charsets.UTF_8), "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, iv),
+        )
+        val sealed = cipher.doFinal(plaintext)
+        val tag = sealed.copyOfRange(sealed.size - 16, sealed.size)
+        val bodyBytes = sealed.copyOfRange(0, sealed.size - 16)
+        val b64 = java.util.Base64.getEncoder()
+        val encryptedEnvelope = "arr:" +
+            b64.encodeToString(iv) + ":" +
+            b64.encodeToString(tag) + ":" +
+            b64.encodeToString(bodyBytes)
+
+        val scriptTags = (1..50).joinToString("") { idx ->
+            """<script src="/_next/static/chunks/chunk-$idx.js"></script>"""
+        }
+        val chapterHtml = "<html><head>$scriptTags</head><body></body></html>"
+
+        try {
+            val result = ExtensionJsRuntime.execute(
+                extension = extension.copy(site = "https://wtr-lab.com/"),
+                operation = "parseChapter",
+                argumentsJson = """["en/serie-42/test-novel/chapter-25"]""",
+                testRequestOverride = { url, method, _, _ ->
+                    when {
+                        url == "https://wtr-lab.com/api/reader/get" -> {
+                            assertEquals("POST", method)
+                            ExtensionHttpClient.TextResponse(
+                                url = url,
+                                statusCode = 200,
+                                contentType = "application/json",
+                                body = """{"success":true,"data":{"data":{"title":"Chapter 25","body":${org.json.JSONObject.quote(encryptedEnvelope)}}}}""",
+                            )
+                        }
+                        url == "https://wtr-lab.com/en/serie-42/test-novel/chapter-25" ->
+                            ExtensionHttpClient.TextResponse(url, 200, "text/html", chapterHtml)
+                        url.contains("/_next/static/chunks/chunk-45.js") ->
+                            ExtensionHttpClient.TextResponse(
+                                url, 200, "application/javascript",
+                                """var k=new TextEncoder().encode("$aesKey");""",
+                            )
+                        url.contains("/_next/static/chunks/") ->
+                            ExtensionHttpClient.TextResponse(url, 200, "application/javascript", "/* unrelated chunk */")
+                        url == "https://wtr-lab.com/api/auth/get-session" ->
+                            ExtensionHttpClient.TextResponse(url, 200, "application/json", "{}")
+                        url == "https://translate-pa.googleapis.com/v1/translateHtml" ->
+                            ExtensionHttpClient.TextResponse(
+                                url, 200, "application/json+protobuf",
+                                """[["<a i=0>Translated paragraph one.</a>","<a i=1>Translated paragraph two.</a>"]]""",
+                            )
+                        else -> throw AssertionError("Unexpected WTR-Lab request: $url")
+                    }
+                },
+            ).getOrThrow()
+
+            val htmlOut = org.json.JSONTokener(result.json).nextValue() as String
+            assertTrue(htmlOut.contains("Chapter 25"))
+            assertTrue(htmlOut.contains("Translated paragraph one."))
+            assertTrue(htmlOut.contains("Translated paragraph two."))
+        } finally {
+            ExtensionJsRuntime.clearSessionStorage(extension.id)
+            file.delete()
+        }
+    }
+
 }

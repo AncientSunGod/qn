@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -26,11 +27,13 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -39,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -46,6 +50,7 @@ import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.PreviewLightDark
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -68,11 +73,8 @@ import com.lagradost.quicknovel.ui.common.SearchResponseAction
 import com.lagradost.quicknovel.ui.common.SearchResponseItem
 import com.lagradost.quicknovel.ui.mainpage.MainPageFragment
 import com.lagradost.quicknovel.ui.mainpage.SearchResponseDialog
-import com.lagradost.quicknovel.ui.settings.searchLangList
-import com.lagradost.quicknovel.ui.settings.searchProvidersList
 import com.lagradost.quicknovel.util.SubtitleHelper
 import com.lagradost.quicknovel.util.Apis.Companion.getApiSettings
-import com.mihon.common.preference.AndroidPreferenceStore
 import com.mihon.presentation.settings.collectAsState
 import kotlinx.collections.immutable.ImmutableSet
 import kotlinx.collections.immutable.toPersistentMap
@@ -206,18 +208,50 @@ fun SearchScreen(state: HomeViewModelState, action: (HomeAction) -> Unit) {
             .nestedScroll(scrollBehavior.nestedScrollConnection)
     ) { innerPadding ->
         if (state.isQueryOpen) {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    // This fixes the double padding from the bottom nav bar
-                    .padding(
-                        start = innerPadding.calculateStartPadding(LocalLayoutDirection.current),
-                        end = innerPadding.calculateEndPadding(LocalLayoutDirection.current),
-                        top = innerPadding.calculateTopPadding()
-                    ),
-            ) {
-                items(state.searchRows, key = { item -> item.name }) { row ->
-                    SearchRow(row, action)
+            if (!state.isLoading && state.searchRows.isEmpty()) {
+                androidx.compose.foundation.layout.Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(
+                            start = innerPadding.calculateStartPadding(LocalLayoutDirection.current),
+                            end = innerPadding.calculateEndPadding(LocalLayoutDirection.current),
+                            top = innerPadding.calculateTopPadding(),
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.search_icon),
+                            contentDescription = null,
+                            modifier = Modifier.size(44.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = "No results found across selected sources.",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        // This fixes the double padding from the bottom nav bar
+                        .padding(
+                            start = innerPadding.calculateStartPadding(LocalLayoutDirection.current),
+                            end = innerPadding.calculateEndPadding(LocalLayoutDirection.current),
+                            top = innerPadding.calculateTopPadding()
+                        ),
+                ) {
+                    items(state.searchRows, key = { item -> item.name }) { row ->
+                        SearchRow(row, action)
+                    }
                 }
             }
         } else {
@@ -232,9 +266,9 @@ fun SearchScreen(state: HomeViewModelState, action: (HomeAction) -> Unit) {
                         end = innerPadding.calculateEndPadding(LocalLayoutDirection.current),
                         top = innerPadding.calculateTopPadding()
                     ),
-                contentPadding = PaddingValues(4.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                contentPadding = PaddingValues(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(state.shownMainPageApis, key = { item -> item.name }) { api ->
                     MainAPIItem(api = api, action = action)
@@ -263,9 +297,8 @@ fun ShowDialog(
                     }
         }.toPersistentMap()
     }
-    val context = LocalContext.current
-    val store = AndroidPreferenceStore(context)
-    val apisSettings = store.searchProvidersList()
+    val settings = rememberAppSettings()
+    val apisSettings = settings.provider.searchProvidersList
     val keys = apisSettings.get().toPersistentSet()
 
     MultiSelectDialog(
@@ -293,34 +326,47 @@ fun MainAPIItem(
     modifier: Modifier = Modifier,
     action: (HomeAction) -> Unit,
 ) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        tonalElevation = 2.dp,
         modifier = modifier
             .fillMaxWidth()
-            .height(100.dp)
-            .rounded()
-            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .height(108.dp)
             .clickable(onClick = {
                 action(HomeAction.Open(api))
-            })
+            }),
     ) {
-        Image(
-            painter = painterResource(api.iconId ?: R.drawable.fiber_new_24px),
-            contentDescription = api.name,
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
             modifier = Modifier
-                .padding(10.dp)
-                .size(40.dp)
-                .rounded()
-                .background(colorResource(api.iconBackgroundId))
-        )
-        Text(
-            text = api.name,
-            color = MaterialTheme.colorScheme.onBackground,
-            fontSize = 14.sp,
-            lineHeight = 15.sp,
-            textAlign = TextAlign.Center
-        )
+                .fillMaxSize()
+                .padding(horizontal = 8.dp, vertical = 10.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(colorResource(api.iconBackgroundId)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    painter = painterResource(api.iconId ?: R.drawable.extension_24px),
+                    contentDescription = api.name,
+                    modifier = Modifier.size(30.dp),
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = api.name,
+                color = MaterialTheme.colorScheme.onSurface,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 

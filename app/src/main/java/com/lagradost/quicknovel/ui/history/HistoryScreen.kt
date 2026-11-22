@@ -40,6 +40,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lagradost.cloudstream4.compose.ActionDialog
 import com.lagradost.cloudstream4.compose.Screen
 import com.lagradost.cloudstream4.compose.SinglePairSelectDialog
+import com.lagradost.cloudstream4.rememberAppSettings
 import com.lagradost.cloudstream4.theme.CloudStreamPreviewTheme
 import com.lagradost.quicknovel.R
 import com.lagradost.quicknovel.compose.BaseSearchBar
@@ -56,13 +57,13 @@ import com.lagradost.quicknovel.ui.history.HistoryAction.ResultAction
 import com.lagradost.quicknovel.ui.history.HistoryAction.Search
 import com.lagradost.quicknovel.ui.history.HistoryAction.SelectSortingMethod
 import com.lagradost.quicknovel.ui.history.HistoryAction.ShowSorting
-import com.mihon.common.preference.AndroidPreferenceStore
 import com.mihon.presentation.settings.collectAsState
 
 object HistoryScreen : Screen {
     @Composable
     override fun Content() {
-        val viewModel = viewModel<HistoryViewModel2>()
+        val settings = rememberAppSettings()
+        val viewModel = viewModel<HistoryViewModel2> { HistoryViewModel2(settings) }
         val state by viewModel.state.collectAsStateWithLifecycle()
         HistoryScreen(state, viewModel::onAction)
     }
@@ -85,9 +86,8 @@ fun HistoryScreen(
         }
     }
 
-    val context = LocalContext.current
-    val store = AndroidPreferenceStore(context)
-    val historyIsRow = store.getBoolean(stringResource(R.string.history_list_view_key), true)
+    val settings = rememberAppSettings()
+    val historyIsRow = settings.history.isRow
     val historyIsRowState by historyIsRow.collectAsState()
 
     var fabExpanded by remember { mutableStateOf(false) }
@@ -99,14 +99,13 @@ fun HistoryScreen(
                 onClick = {
                     action(ShowSorting)
                 },
-                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                contentColor = MaterialTheme.colorScheme.onBackground,
-                // Elevation actually changes the color, because who wanted a sane framework
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                 elevation = FloatingActionButtonDefaults.elevation(
-                    defaultElevation = 0.dp,
-                    pressedElevation = 0.dp,
-                    focusedElevation = 0.dp,
-                    hoveredElevation = 0.dp
+                    defaultElevation = 2.dp,
+                    pressedElevation = 4.dp,
+                    focusedElevation = 2.dp,
+                    hoveredElevation = 3.dp
                 ),
                 text = {
                     Text(stringResource(R.string.filter_dialog_sort_by))
@@ -173,19 +172,53 @@ fun HistoryScreen(
             fabExpanded = false
         })
 
-        SearchList(
-            isRow = historyIsRowState,
-            lazyGridState = lazyGridState,
-            modifier = Modifier
-                // This fixes the double padding from the bottom nav bar
-                .padding(
-                    start = innerPadding.calculateStartPadding(LocalLayoutDirection.current),
-                    end = innerPadding.calculateEndPadding(LocalLayoutDirection.current),
-                    top = innerPadding.calculateTopPadding()
-                ),
-            state = state.history,
-            searchAction = searchAction
-        )
+        val contentPaddingModifier = Modifier
+            .fillMaxSize()
+            // This fixes the double padding from the bottom nav bar
+            .padding(
+                start = innerPadding.calculateStartPadding(LocalLayoutDirection.current),
+                end = innerPadding.calculateEndPadding(LocalLayoutDirection.current),
+                top = innerPadding.calculateTopPadding()
+            )
+
+        if (state.loading && state.history.sorted.isEmpty()) {
+            androidx.compose.foundation.layout.Box(
+                modifier = contentPaddingModifier,
+                contentAlignment = androidx.compose.ui.Alignment.Center,
+            ) {
+                androidx.compose.material3.CircularProgressIndicator()
+            }
+        } else if (!state.loading && state.history.sorted.isEmpty()) {
+            androidx.compose.foundation.layout.Box(
+                modifier = contentPaddingModifier.padding(24.dp),
+                contentAlignment = androidx.compose.ui.Alignment.Center,
+            ) {
+                androidx.compose.foundation.layout.Column(
+                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
+                    verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(10.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_baseline_history_24),
+                        contentDescription = null,
+                        modifier = Modifier.size(44.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = stringResource(R.string.no_data),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else {
+            SearchList(
+                isRow = historyIsRowState,
+                lazyGridState = lazyGridState,
+                modifier = contentPaddingModifier,
+                state = state.history,
+                searchAction = searchAction
+            )
+        }
     }
 }
 
@@ -217,7 +250,7 @@ fun HistoryDialog(
                 title = stringResource(R.string.remove),
                 text = stringResource(
                     R.string.remove_from_history_format,
-                    dialog.about.name
+                    dialog.item.name
                 ),
                 confirmText = stringResource(R.string.remove),
                 dismissText = stringResource(R.string.cancel),
@@ -228,7 +261,7 @@ fun HistoryDialog(
                     action(
                         ResultAction(
                             SearchResponseAction(
-                                dialog.about,
+                                dialog.item,
                                 SearchResponseOperation.Delete
                             )
                         )

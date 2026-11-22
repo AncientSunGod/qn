@@ -18,7 +18,9 @@ import org.jsoup.nodes.Document
 internal fun extractWuxiaBoxSearchId(url: String): String? =
     Regex("""searchid=(\d+)""").find(url)?.groupValues?.getOrNull(1)
 
-open class WuxiaBoxProvider : MainAPI() {
+object WuxiaBoxProvider : WuxiaBoxAPI()
+
+open class WuxiaBoxAPI : MainAPI() {
     companion object {
         const val MAX_CHAPTER_PAGES = 100
         const val MAX_SEARCH_PAGES = 20

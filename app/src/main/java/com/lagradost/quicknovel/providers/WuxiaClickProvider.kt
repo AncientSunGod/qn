@@ -7,6 +7,7 @@ import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.fixUrl
@@ -18,7 +19,7 @@ import com.lagradost.quicknovel.newStreamResponse
 import com.lagradost.quicknovel.setStatus
 import org.jsoup.nodes.Element
 
-class WuxiaClickProvider : MainAPI() {
+object WuxiaClickProvider : MainAPI() {
     override val name = "WuxiaClick"
     override val mainUrl = "https://wuxia.click"
     val secondUrl = "https://wuxiaworld.eu"
@@ -358,7 +359,7 @@ class WuxiaClickProvider : MainAPI() {
                 username = item.ownerUser?.user?.username
                 date = cleanDate
                 avatarUrl = item.ownerUser?.imageUrl
-                rating = item.totalScore?.times(200)
+                score = Score.from5(item.totalScore)
             }
         } ?: emptyList()
     }

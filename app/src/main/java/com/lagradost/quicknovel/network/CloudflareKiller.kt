@@ -14,6 +14,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.time.Duration.Companion.seconds
 
 internal fun isCloudflareChallengeResponse(
     statusCode: Int,
@@ -32,10 +33,15 @@ internal fun isCloudflareChallengeResponse(
     val isChallengeBody = lowerBody.contains("cf-browser-verification") ||
         lowerBody.contains("checking your browser") ||
         lowerBody.contains("just a moment") ||
+        lowerBody.contains("attention required! | cloudflare") ||
         lowerBody.contains("/cdn-cgi/") ||
         lowerBody.contains("one moment...") ||
         lowerBody.contains("un momento…") ||
-        lowerBody.contains("cf-turnstile")
+        lowerBody.contains("cf-turnstile") ||
+        lowerBody.contains("challenges.cloudflare.com") ||
+        lowerBody.contains("verifying access") ||
+        lowerBody.contains("confirm you're human") ||
+        lowerBody.contains("please complete the turnstile")
 
     if (statusCode in setOf(403, 429, 503, 520) && (hasCloudflareHeaders || isChallengeBody)) {
         return true
@@ -68,34 +74,38 @@ class CloudflareKiller : Interceptor {
         val url = request.url.toString()
         val host = request.url.host
 
-        // If we already have cookies in CookieManager, use them
-        val initialCookies = savedCookies[host] ?: getAllCookiesForUrl(url)
-        if (initialCookies.containsKey("cf_clearance")) {
+        // If we already have cookies in CookieManager (e.g. cf_clearance, fr_read, or session
+        // cookies from the integrated in-app browser), replay them with the captured WebView UA.
+        val initialCookies = savedCookies[host]?.takeIf { it.isNotEmpty() } ?: getAllCookiesForUrl(url)
+        if (initialCookies.isNotEmpty()) {
             val response = proceed(request, initialCookies)
             if (!looksLikeCloudflareChallenge(response)) return@runBlocking response
 
-            // If the saved cookies still trigger a challenge, they are expired/invalid
+            // Only clear saved CF clearance if it was invalidated; keep trying bypass/verification
             response.close()
-            clearCookiesForHost(request.url)
-            savedCookies.remove(host)
+            if (initialCookies.containsKey("cf_clearance")) {
+                clearCookiesForHost(request.url)
+                savedCookies.remove(host)
+            }
         }
 
-        // try the request normally. Only invoke WebView bypass when
-        // the response actually looks like a Cloudflare challenge
+        // Try the request normally. Only invoke WebView bypass when the response looks like a challenge.
         val initialResponse = chain.proceed(request)
         if (!looksLikeCloudflareChallenge(initialResponse)) return@runBlocking initialResponse
         initialResponse.close()
 
         // Bypass needed. Locked section to prevent multiple WebViews from opening
         mutex.withLock {
-            val currentCookies = savedCookies[host] ?: getAllCookiesForUrl(url)
-            if (currentCookies.containsKey("cf_clearance")) {
+            val currentCookies = savedCookies[host]?.takeIf { it.isNotEmpty() } ?: getAllCookiesForUrl(url)
+            if (currentCookies.isNotEmpty() && currentCookies != initialCookies) {
                 val response = proceed(request, currentCookies)
                 if (!looksLikeCloudflareChallenge(response)) return@runBlocking response
 
                 response.close()
-                clearCookiesForHost(request.url)
-                savedCookies.remove(host)
+                if (currentCookies.containsKey("cf_clearance")) {
+                    clearCookiesForHost(request.url)
+                    savedCookies.remove(host)
+                }
             }
 
             Log.d(TAG, "Resolving Cloudflare for $host...")
@@ -110,7 +120,16 @@ class CloudflareKiller : Interceptor {
             }
         }
 
-        return@runBlocking chain.proceed(request)
+        val finalResponse = chain.proceed(request)
+        if (looksLikeCloudflareChallenge(finalResponse)) {
+            finalResponse.close()
+            throw CloudflareChallengeException(
+                url = url,
+                host = host,
+                message = "Cloudflare verification required for $host. Tap 'Open verification' to continue.",
+            )
+        }
+        return@runBlocking finalResponse
     }
 
     private fun looksLikeCloudflareChallenge(response: Response): Boolean {
@@ -201,7 +220,8 @@ class CloudflareKiller : Interceptor {
             // Cannot use okhttp (i think intercepting cookies fails which causes the issues)
             useOkhttp = false,
         ).resolveUsingWebView(
-            url
+            url = url,
+            maxTimeout = 22.seconds,
         ) {
             /**
              * Returns true if the cf cookies were successfully fetched from the CookieManager

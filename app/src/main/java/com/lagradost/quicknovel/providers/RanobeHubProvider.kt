@@ -1,16 +1,30 @@
 package com.lagradost.quicknovel.providers
 
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.quicknovel.*
+import com.lagradost.quicknovel.ChapterData
+import com.lagradost.quicknovel.HeadMainPageResponse
+import com.lagradost.quicknovel.LoadResponse
+import com.lagradost.quicknovel.MainAPI
+import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
+import com.lagradost.quicknovel.SearchResponse
+import com.lagradost.quicknovel.UserReview
+import com.lagradost.quicknovel.fixUrlNull
+import com.lagradost.quicknovel.newChapterData
+import com.lagradost.quicknovel.newReview
+import com.lagradost.quicknovel.newSearchResponse
+import com.lagradost.quicknovel.newStreamResponse
+import com.lagradost.quicknovel.setStatus
 import com.lagradost.quicknovel.util.AppUtils.parseJson
 import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
-open class RanobeHubProvider : MainAPI() {
+object RanobeHubProvider : RanobeHubAPI()
+
+open class RanobeHubAPI : MainAPI() {
     override val name = "RanobeHub"
     override val mainUrl = "https://ranobehub.org"
     override val iconId = R.drawable.icon_ranobehub
@@ -58,14 +72,15 @@ open class RanobeHubProvider : MainAPI() {
             url = "$mainUrl/api/search?page=$newPage&sort=$sort&status=$status&take=40"
             val response = app.get(url).parsed<SearchApiResponse>()
 
-            novels.addAll(response.resource.map { item ->
+            novels.addAll(response.resource.mapNotNull { item ->
                 val title = item.names.rus?.takeIf { it.isNotBlank() }
                     ?: item.names.eng?.takeIf { it.isNotBlank() }
-                    ?: item.names.original!!
+                    ?: item.names.original?.takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
 
                 newSearchResponse(title, "/ranobe/${item.id}") {
-                    this.posterUrl = fixUrlNull(item.poster?.medium)
-                    this.rating = item.rating?.let { (it * 100).toInt() }
+                    posterUrl = fixUrlNull(item.poster?.medium)
+                    score = Score.from10(item.rating)
                 }
             })
         }
@@ -84,7 +99,8 @@ open class RanobeHubProvider : MainAPI() {
 
         val title = response.names.rus?.takeIf { it.isNotBlank() }
             ?: response.names.eng?.takeIf { it.isNotBlank() }
-            ?: response.names.original!!
+            ?: response.names.original?.takeIf { it.isNotBlank() }
+            ?: throw com.lagradost.quicknovel.ErrorLoadingException("No title")
 
 
         val chapters = mutableListOf<ChapterData>()
@@ -114,11 +130,11 @@ open class RanobeHubProvider : MainAPI() {
         }
 
         return newStreamResponse(title, url, chapters) {
-            this.posterUrl = fixUrlNull(response.posters?.medium)
-            this.author = response.authors?.firstOrNull()?.nameEng
-            this.synopsis = response.description
-            this.rating = response.rating?.let { (it * 100).toInt() }
-            this.tags = response.tags?.let { tags ->
+            posterUrl = fixUrlNull(response.posters?.medium)
+            author = response.authors?.firstOrNull()?.nameEng
+            synopsis = response.description
+            score = Score.from10(response.rating)
+            tags = response.tags?.let { tags ->
                 (tags.genres.map { it.names.rus ?: it.names.eng ?: it.title } +
                         tags.events.map { it.names.rus ?: it.names.eng ?: it.title })
             }
@@ -156,7 +172,8 @@ open class RanobeHubProvider : MainAPI() {
     override suspend fun loadHtml(url: String): String? {
         val body = app.get("$mainUrl/ranobe/$url").document
         val content = body.select("div.ui.text.container")
-            .first { it.selectFirst("div.title-wrapper") != null }
+            .firstOrNull { it.selectFirst("div.title-wrapper") != null }
+            ?: return null
         content.select("div.chapter-hoticons").remove()
         content.select("img[data-media-id]").forEach { img ->
             val mediaId = img.attr("data-media-id")

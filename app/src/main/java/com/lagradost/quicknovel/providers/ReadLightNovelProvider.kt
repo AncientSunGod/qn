@@ -1,11 +1,22 @@
 package com.lagradost.quicknovel.providers
 
-import com.lagradost.quicknovel.*
-import com.lagradost.quicknovel.MainActivity.Companion.app
+import com.lagradost.quicknovel.ChapterData
+import com.lagradost.quicknovel.HeadMainPageResponse
+import com.lagradost.quicknovel.LoadResponse
+import com.lagradost.quicknovel.MainAPI
+import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
+import com.lagradost.quicknovel.SearchResponse
+import com.lagradost.quicknovel.USER_AGENT
+import com.lagradost.quicknovel.fixUrl
+import com.lagradost.quicknovel.fixUrlNull
+import com.lagradost.quicknovel.newSearchResponse
+import com.lagradost.quicknovel.newStreamResponse
+import com.lagradost.quicknovel.setStatus
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
-class ReadLightNovelProvider : MainAPI() {
+object ReadLightNovelProvider : MainAPI() {
     override val name = "ReadLightNovel"
     override val mainUrl = "https://www.readlightnovel.me"
     override val iconId = R.drawable.big_icon_readlightnovel
@@ -65,8 +76,9 @@ class ReadLightNovelProvider : MainAPI() {
         orderBy: String?,
         tag: String?
     ): HeadMainPageResponse {
+        val safeOrder = orderBy?.takeIf { it.isNotBlank() } ?: "top-rated"
         val url =
-            "$mainUrl/${if (tag == "") "top-novels" else "genre/$tag"}/$orderBy/$page"
+            "$mainUrl/${if (tag.isNullOrBlank()) "top-novels" else "genre/$tag"}/$safeOrder/$page"
         val response = app.get(url)
 
         val document = Jsoup.parse(response.text)
@@ -75,7 +87,7 @@ class ReadLightNovelProvider : MainAPI() {
             val content = it.selectFirst("> div.top-novel-content")
             val nameHeader = it.selectFirst("div.top-novel-header > h2 > a")
             val cUrl = nameHeader?.attr("href") ?: return@mapNotNull null
-            val name = nameHeader.text() ?: return@mapNotNull null
+            val name = nameHeader.text()
             /* val tags = ArrayList(
                  content.select("> div.top-novel-body > div.novel-item > div.content")
                      .last().select("> ul > li > a").map { t -> t.text() })*/
@@ -129,11 +141,11 @@ class ReadLightNovelProvider : MainAPI() {
         return document.select("li > a").mapNotNull { h ->
             val spans = h.select("> span")
 
-            val name = spans[1].text()
-            val url = h?.attr("href") ?: return@mapNotNull null
+            val name = spans.getOrNull(1)?.text()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val url = h.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
 
             newSearchResponse(name = name, url = url) {
-                posterUrl = spans[0].selectFirst("> img")?.attr("src")
+                posterUrl = fixUrlNull(spans.getOrNull(0)?.selectFirst("> img")?.attr("src"))
             }
         }
     }
@@ -145,22 +157,9 @@ class ReadLightNovelProvider : MainAPI() {
             document.select("div.novel-detail-body") //div.novel-details > div.novel-detail-item >
         val names = document.select("div.novel-detail-header").map { t -> t.text() }
 
-        // 0 = Type (ex Web Novel)
-        // 1 = Genre
-        // 2 = Tags
-        // 3 = Language
-        // 4 = Author(s)
-        // 5 = Artist(s)
-        // 6 = Year
-        // 7 = Status
-        // 8 = Description
-        // 9 = Alternative Names
-        // 10 = You May Also Like
-        // 11 = Total Views
-        // 12 = Rating (10 POINT SYSTEM)
-        // 13 = Latest Chapters
-        fun getIndex(name: String): Element { // Bruh, has to do this because sometimes it varies between 14 and 15 elements
-            return info[names.indexOf(name)]
+        fun getIndex(name: String): Element? { // Bruh, has to do this because sometimes it varies between 14 and 15 elements
+            val idx = names.indexOf(name)
+            return if (idx >= 0) info.getOrNull(idx) else null
         }
 
         val name = document.selectFirst("div.block-title")?.text() ?: return null
@@ -193,14 +192,14 @@ class ReadLightNovelProvider : MainAPI() {
 
         return newStreamResponse(url = url, name = name, data = data) {
             posterUrl = fixUrlNull(document.selectFirst("div.novel-cover > a > img")?.attr("src"))
-            setStatus(getIndex("Status").text())
+            setStatus(getIndex("Status")?.text())
             synopsis =
-                getIndex("Description").select("> p").joinToString(separator = "\n\n") { it.text() }
-            rating = (getIndex("Rating").text().toFloat() * 100).toInt()
-            author = getIndex("Author(s)").selectFirst("> ul > li")?.text()
+                getIndex("Description")?.select("> p")?.joinToString(separator = "\n\n") { it.text() }
+            score = Score.from10(getIndex("Rating")?.text())
+            author = getIndex("Author(s)")?.selectFirst("> ul > li")?.text()
             if (author == "N/A") author = null
-            tags = getIndex("Genre").select("ul > li > a").map { it.text() }
-            views = getIndex("Total Views").text().replace(",", "").replace(".", "").toInt()
+            tags = getIndex("Genre")?.select("ul > li > a")?.map { it.text() }
+            views = getIndex("Total Views")?.text()?.replace(",", "")?.replace(".", "")?.toIntOrNull()
         }
     }
 }

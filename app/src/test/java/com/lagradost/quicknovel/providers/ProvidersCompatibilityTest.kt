@@ -169,7 +169,7 @@ class ProvidersCompatibilityTest {
         val shortPart = Base64.getEncoder().encodeToString(sealed.copyOfRange(splitPoint, sealed.size))
         val ivPart = Base64.getEncoder().encodeToString(iv)
 
-        val decrypted = WtrLabProvider().decryptContent("arr:$ivPart:$shortPart:$longPart", dynamicKey)
+        val decrypted = WtrLabProvider.decryptContent("arr:$ivPart:$shortPart:$longPart", dynamicKey)
         assertEquals(listOf("First decrypted paragraph", "Second decrypted paragraph"), decrypted)
     }
 
@@ -180,5 +180,81 @@ class ProvidersCompatibilityTest {
             extractWuxiaBoxSearchId("https://www.wuxiabox.com/e/search/result/?searchid=98765"),
         )
         assertNull(extractWuxiaBoxSearchId("https://www.wuxiabox.com/e/search/index.php"))
+    }
+
+    @Test
+    fun fenrirParsesChapterListAndEnvelopeWithGroupUuid() {
+        val rawEnvelope = """
+            {
+              "data": [
+                {
+                  "id": 10,
+                  "uuid": "abc-123",
+                  "number": 1,
+                  "slug": "chapter-1",
+                  "title": "Awakening",
+                  "group": {"slug": "vol-1"},
+                  "updated_at": "2026-01-15T12:00:00Z"
+                },
+                {
+                  "id": 11,
+                  "uuid": "locked-1",
+                  "number": 2,
+                  "slug": "chapter-2",
+                  "locked": {"price": 50}
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val chapters = parseFenrirChaptersJson(rawEnvelope, "https://fenrirealm.com/series/my-novel")
+        assertEquals(1, chapters.size)
+        assertEquals("Chapter 1 - Awakening", chapters[0].name)
+        assertEquals("https://fenrirealm.com/series/my-novel/vol-1/chapter-1~~abc-123", chapters[0].url)
+        assertEquals("2026-01-15", chapters[0].dateOfRelease)
+    }
+
+    @Test
+    fun wtrLabDecryptContentHandlesUnencryptedJsonParagraphArray() {
+        val plain = WtrLabProvider.decryptContent("""["First paragraph","Second paragraph"]""")
+        assertEquals(listOf("First paragraph", "Second paragraph"), plain)
+    }
+
+    @Test
+    fun novelArrowParsesSearchCardsAndArchiveTemplate() {
+        val searchDoc = Jsoup.parse(
+            """
+            <div id="search-results">
+              <div class="list-novel">
+                <div class="row">
+                  <h3 class="novel-title"><a href="/book/star-odyssey" title="Star Odyssey">Star Odyssey</a></h3>
+                  <img data-src="https://images.novelping.com/novel/star-odyssey.jpg" />
+                  <div class="text-info"><a href="/book/star-odyssey/chapter-100">Chapter 100</a></div>
+                </div>
+              </div>
+            </div>
+            """.trimIndent()
+        )
+        val searchResults = parseNovelPingSearchHtml(searchDoc)
+        assertEquals(1, searchResults.size)
+        assertEquals("Star Odyssey", searchResults[0].name)
+        assertEquals("https://novelping.com/book/star-odyssey", searchResults[0].url)
+        assertEquals("https://images.novelping.com/novel/star-odyssey.jpg", searchResults[0].posterUrl)
+        assertEquals("Chapter 100", searchResults[0].latestChapter)
+
+        val archiveDoc = Jsoup.parse(
+            """
+            <template>
+              <ul>
+                <li><a href="/book/star-odyssey/chapter-1">Chapter 1</a></li>
+                <li><a href="https://novelping.com/book/star-odyssey/chapter-2" title="Chapter 2">Ch 2</a></li>
+              </ul>
+            </template>
+            """.trimIndent()
+        )
+        val chapters = parseNovelPingArchiveHtml(archiveDoc)
+        assertEquals(2, chapters.size)
+        assertEquals("https://novelping.com/book/star-odyssey/chapter-1", chapters[0].url)
+        assertEquals("Chapter 2", chapters[1].name)
     }
 }

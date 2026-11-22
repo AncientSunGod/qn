@@ -63,13 +63,28 @@ object AppUtils {
             }
     }
 
-    fun openInBrowser(url : String) {
+    fun openInBrowser(url: String) {
         try {
             if (url.isBlank()) return
+            val act = activity
+            if (act != null && (url.startsWith("https://", ignoreCase = true) || url.startsWith("http://", ignoreCase = true))) {
+                if (com.lagradost.quicknovel.network.CloudflareVerificationActivity.openInAppBrowser(act, url)) {
+                    return
+                }
+            }
+            openExternalBrowser(act, url)
+        } catch (t: Throwable) {
+            logError(t)
+        }
+    }
+
+    fun openExternalBrowser(context: Context?, url: String) {
+        try {
+            if (context == null || url.isBlank()) return
             val i = Intent(Intent.ACTION_VIEW)
             i.data = url.toUri()
-            activity?.startActivity(i)
-        } catch (t : Throwable) {
+            context.startActivity(i)
+        } catch (t: Throwable) {
             logError(t)
         }
     }

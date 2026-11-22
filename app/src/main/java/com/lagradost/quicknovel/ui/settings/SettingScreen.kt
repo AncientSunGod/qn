@@ -11,13 +11,17 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -27,34 +31,48 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.PreviewLightDark
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.lagradost.cloudstream4.compose.BlackButton
 import com.lagradost.cloudstream4.compose.WhiteButton
@@ -220,7 +238,7 @@ object SettingScreen : SearchableSettings {
                         preference = settings.provider.searchLangList,
                         entries = apis.map { api ->
                             val lang = api.lang
-                            val langName = SubtitleHelper.fromTwoLettersToLanguage(lang)!!
+                            val langName = SubtitleHelper.fromTwoLettersToLanguage(lang) ?: lang.uppercase()
                             lang to langName
                         }.sortedBy { it.second.lowercase() }.map { (code, name) ->
                             val flag = SubtitleHelper.getFlagFromIso(code) ?: "🌐"
@@ -250,28 +268,46 @@ object SettingScreen : SearchableSettings {
                                         .isCloudflareRecoveryEnabled()
                                 )
                             }
-                            Column(
-                                modifier = Modifier.fillMaxWidth().padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                                shape = RoundedCornerShape(16.dp),
+                                tonalElevation = 1.dp,
                             ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    Text("Retry blocked LNReader requests in the in-app browser")
-                                    Switch(
-                                        checked = enabled,
-                                        onCheckedChange = { value ->
-                                            enabled = value
-                                            com.lagradost.quicknovel.extensions.ExtensionHttpClient
-                                                .setCloudflareRecoveryEnabled(value)
-                                        },
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            text = "Retry blocked LNReader requests in the in-app browser",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .padding(end = 12.dp),
+                                        )
+                                        Switch(
+                                            checked = enabled,
+                                            onCheckedChange = { value ->
+                                                enabled = value
+                                                com.lagradost.quicknovel.extensions.ExtensionHttpClient
+                                                    .setCloudflareRecoveryEnabled(value)
+                                            },
+                                        )
+                                    }
+                                    Text(
+                                        "When a site returns a browser-verification response, QuickNovel can open its browser session once and retry with the site's returned cookies. The site still controls access.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
-                                Text(
-                                    "When a site returns a browser-verification response, QuickNovel can open its browser session once and retry with the site's returned cookies. The site still controls access.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
                             }
                         },
                     ),
@@ -378,236 +414,69 @@ object SettingScreen : SearchableSettings {
                                 val officialAdded = extensionRepositories.any {
                                     it.equals(ExtensionRepositoryManager.OFFICIAL_LNREADER_REPO_URL, ignoreCase = true)
                                 }
-                                AlertDialog(
-                                    onDismissRequest = { repositoryDialogOpen = false },
-                                    properties = DialogProperties(usePlatformDefaultWidth = false),
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                                    title = { Text("Extension repositories") },
-                                    text = {
-                                        LazyColumn(
-                                            modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
-                                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            item {
-                                                Text(
-                                                    "Add an LNReader-compatible manifest URL (plugins.min.json).",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                )
-                                                Text(
-                                                    "Security: extension JavaScript runs inside the app process. Install only extensions from repositories you trust.",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.error,
-                                                )
-                                                Spacer(modifier = Modifier.height(6.dp))
-                                                if (!officialAdded) {
-                                                    Button(
-                                                        onClick = {
-                                                            ExtensionRepositoryManager.addRepository(
-                                                                context,
-                                                                ExtensionRepositoryManager.OFFICIAL_LNREADER_REPO_URL,
-                                                            ).onSuccess { updated ->
-                                                                extensionRepositories = updated
-                                                                refreshExtensionCatalog()
-                                                            }.onFailure { error ->
-                                                                repositoryStatus = error.message ?: "Could not add official LNReader repo."
-                                                            }
-                                                        },
-                                                        enabled = !repositoryRefreshing,
-                                                        modifier = Modifier.fillMaxWidth(),
-                                                    ) {
-                                                        Text("Add Official LNReader Repo (370+ sources)")
-                                                    }
-                                                }
-                                                OutlinedTextField(
-                                                    value = repositoryUrlInput,
-                                                    onValueChange = { repositoryUrlInput = it },
-                                                    label = { Text("Custom repository manifest URL") },
-                                                    singleLine = true,
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                                Row(
-                                                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                                                ) {
-                                                    OutlinedButton(
-                                                        onClick = {
-                                                            val result = ExtensionRepositoryManager.addRepository(context, repositoryUrlInput)
-                                                            result.onSuccess { updated ->
-                                                                extensionRepositories = updated
-                                                                repositoryUrlInput = ""
-                                                                refreshExtensionCatalog()
-                                                            }.onFailure { error ->
-                                                                repositoryStatus = error.message ?: "Could not add repository."
-                                                            }
-                                                        },
-                                                        enabled = repositoryUrlInput.isNotBlank() && !repositoryRefreshing,
-                                                    ) { Text("Add") }
-                                                    Button(
-                                                        onClick = { refreshExtensionCatalog() },
-                                                        enabled = !repositoryRefreshing && extensionRepositories.isNotEmpty()
-                                                    ) { Text(if (repositoryRefreshing) "Refreshing…" else "Refresh") }
-                                                    if (repositoryRefreshing) {
-                                                        androidx.compose.material3.CircularProgressIndicator(
-                                                            modifier = Modifier.size(20.dp),
-                                                            strokeWidth = 2.dp
-                                                        )
-                                                    }
-                                                }
-                                                Text(
-                                                    repositoryStatus,
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                )
-                                                Spacer(modifier = Modifier.height(4.dp))
-                                                Text("Repositories (${extensionRepositories.size})", style = MaterialTheme.typography.titleSmall)
-                                            }
-                                            items(extensionRepositories) { repository ->
-                                                Surface(
-                                                    shape = RoundedCornerShape(8.dp),
-                                                    tonalElevation = 1.dp,
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                ) {
-                                                    Row(
-                                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
-                                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
-                                                    ) {
-                                                        Text(repository, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                                                        TextButton(onClick = {
-                                                            extensionRepositories = ExtensionRepositoryManager.removeRepository(context, repository)
-                                                            extensionListings = extensionListings.filterNot { it.repositoryUrl == repository }
-                                                            repositoryStatus = "Repository removed."
-                                                        }) { Text("Remove") }
-                                                    }
-                                                }
-                                            }
-                                            if (installedExtensions.isNotEmpty()) {
-                                                item {
-                                                    Text("Installed (${installedExtensions.size})", style = MaterialTheme.typography.titleSmall)
-                                                }
-                                                items(installedExtensions, key = { "installed:${it.id}" }) { installed ->
-                                                    Surface(
-                                                        shape = RoundedCornerShape(10.dp),
-                                                        tonalElevation = 2.dp,
-                                                        modifier = Modifier.fillMaxWidth(),
-                                                    ) {
-                                                        Row(
-                                                            modifier = Modifier.fillMaxWidth().padding(10.dp),
-                                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                                                        ) {
-                                                            Column(
-                                                                modifier = Modifier.weight(1f),
-                                                                verticalArrangement = Arrangement.spacedBy(2.dp),
-                                                            ) {
-                                                                Text(installed.name, style = MaterialTheme.typography.bodyMedium)
-                                                                Text(
-                                                                    "${installed.language} · v${installed.version} · ${installed.site}",
-                                                                    style = MaterialTheme.typography.bodySmall,
-                                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                                )
-                                                            }
-                                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                                if (installed.hasSettings) {
-                                                                    TextButton(onClick = { openPluginSettings(installed) }) { Text("Settings") }
-                                                                }
-                                                                TextButton(onClick = {
-                                                                    val removedProvider = getInstalledExtensionProviderInfo(context)
-                                                                        .firstOrNull { it.id == installed.id }
-                                                                    val removed = ExtensionRepositoryManager.uninstall(context, installed.id)
-                                                                    installedExtensions = ExtensionRepositoryManager.getInstalledExtensions(context)
-                                                                    if (removed) {
-                                                                        removedProvider?.let { provider ->
-                                                                            settings.provider.searchProvidersList.set(
-                                                                                settings.provider.searchProvidersList.get() - provider.name
-                                                                            )
-                                                                        }
-                                                                        APIRepository.providersActive = context.getApiSettings()
-                                                                        com.lagradost.quicknovel.extensions.ExtensionProviderRegistry.notifyChanged()
-                                                                        repositoryStatus = "${installed.name} uninstalled. Providers refreshed."
-                                                                    } else {
-                                                                        repositoryStatus = "Could not uninstall ${installed.name}."
-                                                                    }
-                                                                }) { Text("Uninstall") }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            item {
-                                                Text(
-                                                    "Available extensions (${filteredExtensionListings.size} of ${extensionListings.size})",
-                                                    style = MaterialTheme.typography.titleSmall,
-                                                )
-                                                OutlinedTextField(
-                                                    value = extensionSearchQuery,
-                                                    onValueChange = { extensionSearchQuery = it },
-                                                    label = { Text("Search name, site, ID or language") },
-                                                    singleLine = true,
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                                if (availableLanguages.size > 1) {
-                                                    LazyRow(
-                                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                                    ) {
-                                                        items(availableLanguages) { language ->
-                                                            FilterChip(
-                                                                selected = selectedLanguageFilter == language,
-                                                                onClick = { selectedLanguageFilter = language },
-                                                                label = { Text(language) },
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            items(filteredExtensionListings, key = { "${it.repositoryUrl}:${it.id}" }) { entry ->
-                                                val installed = installedExtensions.firstOrNull { it.id == entry.id }
-                                                Surface(
-                                                    shape = RoundedCornerShape(10.dp),
-                                                    tonalElevation = 1.dp,
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                ) {
-                                                    Row(
-                                                        modifier = Modifier.fillMaxWidth().padding(10.dp),
-                                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                                                    ) {
-                                                        Column(
-                                                            modifier = Modifier.weight(1f).padding(end = 8.dp),
-                                                            verticalArrangement = Arrangement.spacedBy(2.dp),
-                                                        ) {
-                                                            Text(entry.name, style = MaterialTheme.typography.bodyMedium)
-                                                            Text(
-                                                                "${entry.language} · v${entry.version} · ${entry.site}",
-                                                                style = MaterialTheme.typography.bodySmall,
-                                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                            )
-                                                        }
-                                                        Button(
-                                                            onClick = { pendingExtensionInstall = entry },
-                                                            enabled = !repositoryRefreshing
-                                                        ) {
-                                                            Text(
-                                                                when {
-                                                                    installed == null -> "Install"
-                                                                    installed.version != entry.version -> "Update"
-                                                                    else -> "Reinstall"
-                                                                }
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if (filteredExtensionListings.isEmpty() && extensionListings.isNotEmpty()) {
-                                                item { Text("No extensions match this filter.", style = MaterialTheme.typography.bodySmall) }
-                                            }
+                                ExtensionsManagerDialog(
+                                    officialAdded = officialAdded,
+                                    extensionRepositories = extensionRepositories,
+                                    extensionListings = extensionListings,
+                                    filteredExtensionListings = filteredExtensionListings,
+                                    installedExtensions = installedExtensions,
+                                    availableLanguages = availableLanguages,
+                                    selectedLanguageFilter = selectedLanguageFilter,
+                                    onSelectLanguageFilter = { selectedLanguageFilter = it },
+                                    extensionSearchQuery = extensionSearchQuery,
+                                    onExtensionSearchQueryChange = { extensionSearchQuery = it },
+                                    repositoryUrlInput = repositoryUrlInput,
+                                    onRepositoryUrlInputChange = { repositoryUrlInput = it },
+                                    repositoryStatus = repositoryStatus,
+                                    repositoryRefreshing = repositoryRefreshing,
+                                    onAddOfficialRepo = {
+                                        ExtensionRepositoryManager.addRepository(
+                                            context,
+                                            ExtensionRepositoryManager.OFFICIAL_LNREADER_REPO_URL,
+                                        ).onSuccess { updated ->
+                                            extensionRepositories = updated
+                                            refreshExtensionCatalog()
+                                        }.onFailure { error ->
+                                            repositoryStatus = error.message ?: "Could not add official LNReader repo."
                                         }
                                     },
-                                    confirmButton = {
-                                        TextButton(onClick = { repositoryDialogOpen = false }) { Text("Done") }
-                                    }
+                                    onAddCustomRepo = {
+                                        ExtensionRepositoryManager.addRepository(context, repositoryUrlInput)
+                                            .onSuccess { updated ->
+                                                extensionRepositories = updated
+                                                repositoryUrlInput = ""
+                                                refreshExtensionCatalog()
+                                            }.onFailure { error ->
+                                                repositoryStatus = error.message ?: "Could not add repository."
+                                            }
+                                    },
+                                    onRemoveRepo = { repository ->
+                                        extensionRepositories = ExtensionRepositoryManager.removeRepository(context, repository)
+                                        extensionListings = extensionListings.filterNot { it.repositoryUrl == repository }
+                                        repositoryStatus = "Repository removed."
+                                    },
+                                    onRefreshCatalog = { refreshExtensionCatalog() },
+                                    onInstallExtension = { entry -> pendingExtensionInstall = entry },
+                                    onOpenExtensionSettings = { installed -> openPluginSettings(installed) },
+                                    onUninstallExtension = { installed ->
+                                        val removedProvider = getInstalledExtensionProviderInfo(context)
+                                            .firstOrNull { it.id == installed.id }
+                                        val removed = ExtensionRepositoryManager.uninstall(context, installed.id)
+                                        installedExtensions = ExtensionRepositoryManager.getInstalledExtensions(context)
+                                        if (removed) {
+                                            removedProvider?.let { provider ->
+                                                settings.provider.searchProvidersList.set(
+                                                    settings.provider.searchProvidersList.get() - provider.name
+                                                )
+                                            }
+                                            APIRepository.providersActive = context.getApiSettings()
+                                            com.lagradost.quicknovel.extensions.ExtensionProviderRegistry.notifyChanged()
+                                            repositoryStatus = "${installed.name} uninstalled. Providers refreshed."
+                                        } else {
+                                            repositoryStatus = "Could not uninstall ${installed.name}."
+                                        }
+                                    },
+                                    onDismiss = { repositoryDialogOpen = false },
                                 )
                             }
                             if (pendingExtensionSettings != null) {
@@ -854,6 +723,12 @@ object SettingScreen : SearchableSettings {
                         subtitle = stringResource(R.string.show_app_updates_desc),
                         preference = settings.download.autoUpdate,
                     ),
+                    Preference.PreferenceItem.SwitchPreference(
+                        icon = painterResource(R.drawable.notifications_active_24px),
+                        title = stringResource(R.string.dont_disturb_updates),
+                        subtitle = stringResource(R.string.dont_disturb_updates_desc),
+                        preference = settings.updates.dontDisturbUpdates,
+                    ),
                     Preference.PreferenceItem.TextPreference(
                         icon = painterResource(R.drawable.save_as_24px),
                         title = stringResource(R.string.backup_settings),
@@ -919,6 +794,11 @@ object SettingScreen : SearchableSettings {
                         title = stringResource(R.string.external_reader),
                         subtitle = stringResource(R.string.external_reader_desc),
                         preference = settings.reader.externalReader,
+                    ),
+                    Preference.PreferenceItem.SwitchPreference(
+                        icon = painterResource(R.drawable.article_24px),
+                        title = stringResource(R.string.show_authors_notes),
+                        preference = settings.reader.authorNotes,
                     ),
                     // Removed as the actual bloat filtering is shit and not very useful,
                     // but can increase the time too much
@@ -1200,6 +1080,492 @@ fun RoundColor(color: Color) {
             )
             .background(color, CircleShape)
     )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ExtensionsManagerDialog(
+    officialAdded: Boolean,
+    extensionRepositories: List<String>,
+    extensionListings: List<com.lagradost.quicknovel.extensions.ExtensionListing>,
+    filteredExtensionListings: List<com.lagradost.quicknovel.extensions.ExtensionListing>,
+    installedExtensions: List<InstalledExtension>,
+    availableLanguages: List<String>,
+    selectedLanguageFilter: String,
+    onSelectLanguageFilter: (String) -> Unit,
+    extensionSearchQuery: String,
+    onExtensionSearchQueryChange: (String) -> Unit,
+    repositoryUrlInput: String,
+    onRepositoryUrlInputChange: (String) -> Unit,
+    repositoryStatus: String,
+    repositoryRefreshing: Boolean,
+    onAddOfficialRepo: () -> Unit,
+    onAddCustomRepo: () -> Unit,
+    onRemoveRepo: (String) -> Unit,
+    onRefreshCatalog: () -> Unit,
+    onInstallExtension: (com.lagradost.quicknovel.extensions.ExtensionListing) -> Unit,
+    onOpenExtensionSettings: (InstalledExtension) -> Unit,
+    onUninstallExtension: (InstalledExtension) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var selectedTab by remember {
+        mutableIntStateOf(
+            when {
+                extensionRepositories.isEmpty() -> 2
+                installedExtensions.isNotEmpty() -> 1
+                else -> 0
+            }
+        )
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
+    ) {
+        Scaffold(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding(),
+            topBar = {
+                Column {
+                    TopAppBar(
+                        title = {
+                            Text(
+                                text = "Extensions",
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        },
+                        navigationIcon = {
+                            IconButton(onClick = onDismiss) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_baseline_arrow_back_24),
+                                    contentDescription = stringResource(R.string.close),
+                                )
+                            }
+                        },
+                        actions = {
+                            IconButton(
+                                onClick = onRefreshCatalog,
+                                enabled = !repositoryRefreshing && extensionRepositories.isNotEmpty(),
+                            ) {
+                                if (repositoryRefreshing) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                } else {
+                                    Icon(
+                                        painter = painterResource(R.drawable.refresh),
+                                        contentDescription = "Refresh repositories",
+                                    )
+                                }
+                            }
+                        },
+                    )
+                    PrimaryTabRow(selectedTabIndex = selectedTab) {
+                        Tab(
+                            selected = selectedTab == 0,
+                            onClick = { selectedTab = 0 },
+                            text = {
+                                Text(
+                                    text = "Browse (${filteredExtensionListings.size})",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                        )
+                        Tab(
+                            selected = selectedTab == 1,
+                            onClick = { selectedTab = 1 },
+                            text = {
+                                Text(
+                                    text = "Installed (${installedExtensions.size})",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                        )
+                        Tab(
+                            selected = selectedTab == 2,
+                            onClick = { selectedTab = 2 },
+                            text = {
+                                Text(
+                                    text = "Repos (${extensionRepositories.size})",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                        )
+                    }
+                    if (repositoryRefreshing) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    if (repositoryStatus.isNotBlank()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                text = repositoryStatus,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            },
+        ) { innerPadding ->
+            when (selectedTab) {
+                0 -> {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding),
+                    ) {
+                        OutlinedTextField(
+                            value = extensionSearchQuery,
+                            onValueChange = onExtensionSearchQueryChange,
+                            label = { Text("Search name, site, ID or language") },
+                            leadingIcon = {
+                                Icon(
+                                    painter = painterResource(R.drawable.search_icon),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            },
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                        if (availableLanguages.size > 1) {
+                            LazyRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                items(availableLanguages) { language ->
+                                    FilterChip(
+                                        selected = selectedLanguageFilter == language,
+                                        onClick = { onSelectLanguageFilter(language) },
+                                        label = { Text(language) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            if (extensionRepositories.isEmpty()) {
+                                item {
+                                    Surface(
+                                        shape = RoundedCornerShape(16.dp),
+                                        tonalElevation = 2.dp,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(18.dp),
+                                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                                        ) {
+                                            Text(
+                                                "No extension repositories configured",
+                                                style = MaterialTheme.typography.titleMedium,
+                                            )
+                                            Text(
+                                                "Add the official LNReader repository or a custom plugins.min.json URL to browse extensions.",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                            if (!officialAdded) {
+                                                Button(
+                                                    onClick = onAddOfficialRepo,
+                                                    enabled = !repositoryRefreshing,
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                ) {
+                                                    Text("Add Official LNReader Repo (370+ sources)")
+                                                }
+                                            }
+                                            OutlinedButton(
+                                                onClick = { selectedTab = 2 },
+                                                modifier = Modifier.fillMaxWidth(),
+                                            ) {
+                                                Text("Manage Repositories")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            items(filteredExtensionListings, key = { "${it.repositoryUrl}:${it.id}" }) { entry ->
+                                val installed = installedExtensions.firstOrNull { it.id == entry.id }
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    tonalElevation = 2.dp,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(14.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Column(
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .padding(end = 10.dp),
+                                            verticalArrangement = Arrangement.spacedBy(3.dp),
+                                        ) {
+                                            Text(
+                                                text = entry.name,
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.Medium,
+                                            )
+                                            Text(
+                                                text = "${entry.language} · v${entry.version} · ${entry.site}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        Button(
+                                            onClick = { onInstallExtension(entry) },
+                                            enabled = !repositoryRefreshing,
+                                        ) {
+                                            Text(
+                                                when {
+                                                    installed == null -> "Install"
+                                                    installed.version != entry.version -> "Update"
+                                                    else -> "Reinstall"
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            if (filteredExtensionListings.isEmpty() && extensionListings.isNotEmpty()) {
+                                item {
+                                    Text(
+                                        "No extensions match this filter.",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(vertical = 12.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                1 -> {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding),
+                        contentPadding = PaddingValues(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        if (installedExtensions.isEmpty()) {
+                            item {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    tonalElevation = 2.dp,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(18.dp),
+                                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                                    ) {
+                                        Text(
+                                            "No extensions installed",
+                                            style = MaterialTheme.typography.titleMedium,
+                                        )
+                                        Text(
+                                            "Browse available repositories to install LNReader sources.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Button(onClick = { selectedTab = 0 }) {
+                                            Text("Browse Extensions")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        items(installedExtensions, key = { "installed:${it.id}" }) { installed ->
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                tonalElevation = 2.dp,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(
+                                            text = installed.name,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Medium,
+                                        )
+                                        Text(
+                                            text = "${installed.language} · v${installed.version} · ${installed.site}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.End,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        if (installed.hasSettings) {
+                                            OutlinedButton(
+                                                onClick = { onOpenExtensionSettings(installed) },
+                                                modifier = Modifier.padding(end = 8.dp),
+                                            ) {
+                                                Text("Settings")
+                                            }
+                                        }
+                                        TextButton(onClick = { onUninstallExtension(installed) }) {
+                                            Text("Uninstall")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                else -> {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding),
+                        contentPadding = PaddingValues(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        item {
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                color = MaterialTheme.colorScheme.errorContainer,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    text = "Security: extension JavaScript runs inside the app process. Install only extensions from repositories you trust.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.padding(12.dp),
+                                )
+                            }
+                        }
+                        if (!officialAdded) {
+                            item {
+                                Button(
+                                    onClick = onAddOfficialRepo,
+                                    enabled = !repositoryRefreshing,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("Add Official LNReader Repo (370+ sources)")
+                                }
+                            }
+                        }
+                        item {
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                tonalElevation = 2.dp,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    Text(
+                                        text = "Add repository",
+                                        style = MaterialTheme.typography.titleSmall,
+                                    )
+                                    OutlinedTextField(
+                                        value = repositoryUrlInput,
+                                        onValueChange = onRepositoryUrlInputChange,
+                                        label = { Text("Repository manifest URL (plugins.min.json)") },
+                                        singleLine = true,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Button(
+                                            onClick = onAddCustomRepo,
+                                            enabled = repositoryUrlInput.isNotBlank() && !repositoryRefreshing,
+                                            modifier = Modifier.weight(1f),
+                                        ) {
+                                            Text("Add URL")
+                                        }
+                                        OutlinedButton(
+                                            onClick = onRefreshCatalog,
+                                            enabled = !repositoryRefreshing && extensionRepositories.isNotEmpty(),
+                                            modifier = Modifier.weight(1f),
+                                        ) {
+                                            Text(if (repositoryRefreshing) "Refreshing…" else "Refresh")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        items(extensionRepositories) { repository ->
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                tonalElevation = 1.dp,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = repository,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .padding(end = 8.dp),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    IconButton(onClick = { onRemoveRepo(repository) }) {
+                                        Icon(
+                                            painter = painterResource(R.drawable.delete_24px),
+                                            contentDescription = "Remove repository",
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @PreviewLightDark

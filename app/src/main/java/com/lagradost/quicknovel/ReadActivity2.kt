@@ -321,6 +321,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                         it.bottom >= bottomY
                     } ?: lines.lastOrNull() ?: return true
                     binding.realText.scrollBy(0, line.top - getTopY())
+                    binding.realText.post { onScroll() }
 
                     return true
                 }
@@ -339,6 +340,7 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                             it.top >= topY
                         } ?: return@post
                         binding.realText.scrollBy(0, line.top - getTopY())
+                        onScroll()
                     }
 
                     return true
@@ -1441,6 +1443,34 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                     binding.readLoading.isVisible = false
                     binding.readFail.isVisible = true
                     binding.failText.text = loading.errorString
+
+                    val cfChallenge = com.lagradost.quicknovel.network.CloudflareChallengeManager
+                        .findCloudflareChallenge(loading.cause)
+                    val chapterUrl = viewModel.getCurrentChapterUrl()
+                    val verifyUrl = cfChallenge?.url?.takeIf { it.isNotBlank() } ?: chapterUrl
+
+                    binding.readFailRetry.setOnClickListener {
+                        viewModel.retryCurrentOrReinit(intent, this@ReadActivity2)
+                    }
+                    binding.readFailVerify.apply {
+                        isVisible = !verifyUrl.isNullOrBlank()
+                        setOnClickListener {
+                            val target = verifyUrl ?: return@setOnClickListener
+                            lifecycleScope.launch {
+                                com.lagradost.quicknovel.network.CloudflareChallengeManager.verify(
+                                    this@ReadActivity2,
+                                    target,
+                                )
+                                viewModel.retryCurrentOrReinit(intent, this@ReadActivity2)
+                            }
+                        }
+                    }
+                    binding.readFailOpenBrowser.apply {
+                        isVisible = cfChallenge == null && !chapterUrl.isNullOrBlank()
+                        setOnClickListener {
+                            chapterUrl?.let { com.lagradost.quicknovel.util.AppUtils.openInBrowser(it) }
+                        }
+                    }
                 }
             }
         }
@@ -1998,9 +2028,10 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
                     viewModel.scrollWithVolume = isChecked
                 }
 
-                readSettingsAuthorNotes.isChecked = viewModel.authorNotes
+                val appSettings = com.lagradost.cloudstream4.AppSettings(this@ReadActivity2)
+                readSettingsAuthorNotes.isChecked = appSettings.reader.authorNotes.get()
                 readSettingsAuthorNotes.setOnCheckedChangeListener { _, isChecked ->
-                    viewModel.authorNotes = isChecked
+                    appSettings.reader.authorNotes.set(isChecked)
                     viewModel.refreshChapters()
                 }
 
@@ -2141,5 +2172,12 @@ class ReadActivity2 : AppCompatActivity(), ColorPickerDialogListener {
         }
         // Start asynchronous book loading only after the complete reader UI is ready.
         viewModel.init(intent, this)
+    }
+
+    fun openCloudflareVerification(chapterIndex: Int, url: String) {
+        lifecycleScope.launch {
+            com.lagradost.quicknovel.network.CloudflareChallengeManager.verify(this@ReadActivity2, url)
+            viewModel.reloadChapter(chapterIndex)
+        }
     }
 }

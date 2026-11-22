@@ -86,83 +86,83 @@ class Apis {
         @Volatile
         internal var testApisOverride: List<MainAPI>? = null
 
-        private val builtInApis: List<MainAPI> = arrayOf(
-            //AllProvider(),
-            AllNovelProvider(),
-            AnnasArchive(),
-            ArNoProvider(),
-            AsianNovelProvider(),
-            //AzynovelProvider(), // dont exist anymore
-            //BestLightNovelProvider(), //dont exist anymore
-            BrightNovelProvider(),
-            ChrysanthemumGardenProvider(),
-            ChikariProvider(),
-            //ComrademaoProvider(), // domain sold/down?
-            DevilNovelsProvider(),
-            //EfremnetProvider(), // domain is expired
-            //EngNovelProvider(),
-            FanMtlnProvider(),
-            FaqWikiProvider(),
-            FenrirRealProvider(),
-            FreewebnovelProvider(),
-            GraycityProvider(),
-            GalaxyNovelsProvider(),
-            HiraethTranslationProvider(),
-            IndoWebNovelProvider(),
-            KolNovelProvider(),
-            LibReadProvider(),
-            //LightNovelPubProvider(), // Got cloudflare, but probably bypassable
-            LightNovelTranslationsProvider(),
-           // LightNovelWorldProvider(), // Replaced with chikari.moe
-            LnoriProvider(),
-            LnMTLProvider(),
-            LuxonScansProvider(),
-            MeioNovelProvider(),
-            //MNovelFreeProvider(), // same as NovelFullVipProvider
-            MtlNovelProvider(),
-            NoBadNovelProvider(),
-            NovelasLigerasProvider(),
-            NovelBinProvider(),
-            NovelBuddyProvider(),
-            NovelFireProvider(),
-            NovelArrowProvider(),
-            NovelFullNETProvider(),
-            NovelFullProvider(),
-            NovelLightProvider(),
-            NovelManiaProvider(),
-            NovelFranceProvider(),
-            //NovelPassionProvider(), // Site gone
-            //NovelsOnlineProvider(), // not working
-            NovLoveProvider(),
-            NovelPhoenixProvider(),
-            PawReadProver(),
-            //PlanetaEpubProvider(), //not working
-            QuanbenProvider(),
-            RanobesProvider(),
-            RanovelProvider(),
-            RanobeHubProvider(),
-            //RanobesProvider(),
-            //ReadAnyBookProvider(), // Books locked behind login
-            ReadfromnetProvider(),
-            ReadhiveProvider(),
-            //ReadLightNovelProvider(), // NOT WORKING?
-            ReadNovelFullProvider(),
-            ReadOnlineFreeBookProvider(),
-            RewayatProvider(),
-            RoyalRoadProvider(),
-            SakuraNovelProvider(), // cloudflare?
-            ScribblehubProvider(),
-            ScrollersPubProvider(),
-            SyosetuProvider(),
-            SkyNovelsProvider(),
-            SonicMTLProvider(),
-            WattpadProvider(),
-            WtrLabProvider(),
-            WuxiaBoxProvider(),
-            WuxiaClickProvider(),
-            WuxiaWorldProvider(),
-            //WuxiaWorldOnlineProvider(), // Site does not work
-            //WuxiaWorldSiteProvider(),
+        private val builtInApis: List<MainAPI> = listOf(
+            //AllProvider,
+            AllNovelProvider,
+            AnnasArchive,
+            ArNoProvider,
+            AsianNovelProvider,
+            //AzynovelProvider, // dont exist anymore
+            //BestLightNovelProvider, //dont exist anymore
+            BrightNovelProvider,
+            ChrysanthemumGardenProvider,
+            ChikariProvider,
+            //ComrademaoProvider, // domain sold/down?
+            DevilNovelsProvider,
+            //EfremnetProvider, // domain is expired
+            //EngNovelProvider,
+            FanMtlnProvider,
+            FaqWikiProvider,
+            FenrirRealProvider,
+            FreewebnovelProvider,
+            GraycityProvider,
+            GalaxyNovelsProvider,
+            HiraethTranslationProvider,
+            IndoWebNovelProvider,
+            KolNovelProvider,
+            LibReadProvider,
+            //LightNovelPubProvider, // Got cloudflare, but probably bypassable
+            LightNovelTranslationsProvider,
+            // LightNovelWorldProvider, // Replaced with chikari.moe
+            LnoriProvider,
+            LnMTLProvider,
+            LuxonScansProvider,
+            MeioNovelProvider,
+            //MNovelFreeProvider, // same as NovelFullVipProvider
+            MtlNovelProvider,
+            NoBadNovelProvider,
+            NovelasLigerasProvider,
+            NovelBinProvider,
+            NovelBuddyProvider,
+            NovelFireProvider,
+            NovelArrowProvider,
+            NovelFullNETProvider,
+            NovelFullProvider,
+            NovelLightProvider,
+            NovelManiaProvider,
+            NovelFranceProvider,
+            //NovelPassionProvider, // Site gone
+            //NovelsOnlineProvider, // not working
+            NovLoveProvider,
+            NovelPhoenixProvider,
+            PawReadProver,
+            //PlanetaEpubProvider, //not working
+            QuanbenProvider,
+            RanobesProvider,
+            RanovelProvider,
+            RanobeHubProvider,
+            //RanobesProvider,
+            //ReadAnyBookProvider, // Books locked behind login
+            ReadfromnetProvider,
+            ReadhiveProvider,
+            //ReadLightNovelProvider, // NOT WORKING?
+            ReadNovelFullProvider,
+            ReadOnlineFreeBookProvider,
+            RewayatProvider,
+            RoyalRoadProvider,
+            SakuraNovelProvider, // cloudflare?
+            ScribblehubProvider,
+            ScrollersPubProvider,
+            SyosetuProvider,
+            SkyNovelsProvider,
+            SonicMTLProvider,
+            WattpadProvider,
+            WtrLabProvider,
+            WuxiaBoxProvider,
+            WuxiaClickProvider,
+            WuxiaWorldProvider,
+            //WuxiaWorldOnlineProvider, // Site does not work
+            //WuxiaWorldSiteProvider,
         ).sortedBy { it.name }
 
         /**
@@ -244,7 +244,7 @@ class Apis {
                     return APIRepository(a)
                 }
             }
-            if (name == RedditProvider().name) return APIRepository(RedditProvider())
+            if (name == RedditProvider.name) return APIRepository(RedditProvider)
             return null
         }
 

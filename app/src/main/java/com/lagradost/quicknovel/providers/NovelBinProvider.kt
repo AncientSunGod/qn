@@ -19,7 +19,9 @@ import com.lagradost.quicknovel.setStatus
 import org.jsoup.nodes.Document
 
 
-open class NovelBinProvider : MainAPI() {
+object NovelBinProvider : NovelBinAPI()
+
+open class NovelBinAPI : MainAPI() {
     override val name = "NovelBin"
     override val mainUrl = "https://novelarrow.com"
     override val hasMainPage = true

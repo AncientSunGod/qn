@@ -6,6 +6,7 @@ import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.USER_AGENT
 import com.lagradost.quicknovel.UserReview
@@ -14,8 +15,8 @@ import com.lagradost.quicknovel.newChapterData
 import com.lagradost.quicknovel.newReview
 import com.lagradost.quicknovel.newSearchResponse
 import com.lagradost.quicknovel.newStreamResponse
-import com.lagradost.quicknovel.providers.LibReadProvider.ChaptersResponse
-import com.lagradost.quicknovel.providers.LibReadProvider.LibReadCommentsResponse
+import com.lagradost.quicknovel.providers.LibReadAPI.ChaptersResponse
+import com.lagradost.quicknovel.providers.LibReadAPI.LibReadCommentsResponse
 import com.lagradost.quicknovel.setStatus
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -151,7 +152,9 @@ internal fun extractFreeWebNovelAcode(document: Document, fallback: String): Str
         ?.takeIf { it.isNotBlank() }
         ?: fallback
 
-open class FreewebnovelProvider : MainAPI() {
+object FreewebnovelProvider : FreewebnovelAPI()
+
+open class FreewebnovelAPI : MainAPI() {
     private companion object { const val MAX_TOC_PAGES = 200 }
     override val name = "FreeWebNovel"
     override val mainUrl = "https://freewebnovel.com"
@@ -213,15 +216,19 @@ open class FreewebnovelProvider : MainAPI() {
         orderBy: String?,
         tag: String?
     ): HeadMainPageResponse {
+        val safeOrder = orderBy?.takeIf { it.isNotBlank() } ?: "latest-release"
         val url =
-            if (tag.isNullOrBlank()) "$mainUrl/sort/$orderBy/${if(mainCategory.isNullOrBlank()) "" else "$mainCategory/"}$page" else "$mainUrl/genre/$tag/${if (mainCategory.isNullOrBlank()) "" else "$mainCategory/"}$page"
+            if (tag.isNullOrBlank()) "$mainUrl/sort/$safeOrder/${if (mainCategory.isNullOrBlank()) "" else "$mainCategory/"}$page" else "$mainUrl/genre/$tag/${if (mainCategory.isNullOrBlank()) "" else "$mainCategory/"}$page"
         val document = app.get(url).document
         val headers = document.select("div.ul-list1.ul-list1-2.ss-custom > div.li-row")
         val returnValue = headers.mapNotNull { h ->
             val h3 = h.selectFirst("h3.tit > a") ?: return@mapNotNull null
+            val title = h3.attr("title").trim().ifBlank { h3.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
+            val href = h3.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
             newSearchResponse(
-                name = h3.attr("title"),
-                url = h3.attr("href") ?: return@mapNotNull null
+                name = title,
+                url = href
             ) {
                 posterUrl = fixUrlNull(
                     h.selectFirst("picture source")
@@ -230,8 +237,8 @@ open class FreewebnovelProvider : MainAPI() {
                         ?.lastOrNull()
                         ?.trim()
                         ?.substringBefore(" ")
-                ) ?: fixUrlNull(document.selectFirst("div.pic img")?.attr("src"))
-                latestChapter = h.select("div.item")[2].selectFirst("> div > a")?.text()
+                ) ?: fixUrlNull(h.selectFirst("div.pic img")?.attr("src"))
+                latestChapter = h.select("div.item").getOrNull(2)?.selectFirst("> div > a")?.text()
             }
         }
         return HeadMainPageResponse(url, returnValue)
@@ -263,7 +270,11 @@ open class FreewebnovelProvider : MainAPI() {
             )
             if (pageChapters.isEmpty()) break
 
-            pageChapters.forEach { chapter -> chapters.putIfAbsent(chapter.url, chapter) }
+            pageChapters.forEach { chapter ->
+                if (!chapters.containsKey(chapter.url)) {
+                    chapters[chapter.url] = chapter
+                }
+            }
             page++
             if (page <= totalPages) kotlinx.coroutines.delay(150)
         }
@@ -274,27 +285,28 @@ open class FreewebnovelProvider : MainAPI() {
     suspend fun getChapterList(doc: Document, url: String): List<ChapterData> {
         val pageUrl = url.substringBefore("?").substringBefore("#")
         val baseUrl = pageUrl.removeSuffix("/").removeSuffix(".html")
-        val pageUri = Uri.parse(pageUrl)
-        val pageRoot = "${pageUri.scheme}://${pageUri.authority}"
+        val pageUri = java.net.URI(pageUrl)
+        val pageRoot = "${pageUri.scheme}://${pageUri.rawAuthority}"
         val acode = extractFreeWebNovelAcode(doc, getAcode(baseUrl))
         val chaptersByUrl = linkedMapOf<String, ChapterData>()
 
         fun parseTocPage(tocDocument: Document) {
-            // The detail page may be redirected between LibRead and FreeWebNovel.
-            // Resolve initial-page links against the final URL returned by the request.
             parseFreeWebNovelTocLinks(tocDocument, siteRoot = pageRoot).forEach { chapter ->
-                chaptersByUrl.putIfAbsent(chapter.url, chapter)
+                if (!chaptersByUrl.containsKey(chapter.url)) {
+                    chaptersByUrl[chapter.url] = chapter
+                }
             }
         }
 
-        // First use the paginated AJAX contract used by the official LNReader
-        // ReadNovelFull multisrc source (40 chapters per page). Fetch every page:
-        // a single random-cursor request to chapterlist.php can return only a
-        // fragment and is a common reason large novels appear to have 0 chapters.
         parseTocPage(doc)
         val paginatedChapters = runCatching {
             getPaginatedAjaxChapters(pageUrl, pageRoot)
-        }.getOrDefault(emptyList())
+        }.getOrElse { error ->
+            if (com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(error) != null) {
+                throw error
+            }
+            emptyList()
+        }
         if (paginatedChapters.isNotEmpty()) return paginatedChapters
 
         val totalChapters = extractFreeWebNovelTotalChapters(doc)
@@ -315,9 +327,6 @@ open class FreewebnovelProvider : MainAPI() {
             val apiChapters = runCatching {
                 val endpoint = "$secondUrl/api/chapterlist.php"
                 val responseText = if (totalChapters != null && totalChapters > 0) {
-                    // Mirrors the official plugin's cursor request. Do not use this
-                    // fallback for titles marked Adult/Ecchi/Smut/Mature: load() rejects
-                    // those genres before the chapter list is requested.
                     val chapterCursor = kotlin.random.Random.nextInt(totalChapters)
                     app.post(
                         endpoint,
@@ -332,8 +341,8 @@ open class FreewebnovelProvider : MainAPI() {
                         ),
                     ).text
                 } else {
-                    // Older pages without total-chapter metadata use the source's GET form.
-                    app.get("$endpoint?aid=${Uri.encode(novelId)}").text
+                    val encodedId = java.net.URLEncoder.encode(novelId, "UTF-8")
+                    app.get("$endpoint?aid=$encodedId").text
                 }
 
                 val fragment = parseFreeWebNovelTocAjaxResponse(responseText).html
@@ -342,22 +351,25 @@ open class FreewebnovelProvider : MainAPI() {
                     siteRoot = secondUrl,
                     includeOptions = true,
                 )
-            }.getOrDefault(emptyList())
+            }.getOrElse { error ->
+                if (com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(error) != null) {
+                    throw error
+                }
+                emptyList()
+            }
 
             if (apiChapters.isNotEmpty()) return apiChapters
         }
         if (chaptersByUrl.isNotEmpty()) return chaptersByUrl.values.toList()
 
-        // Last-resort selectors for older page layouts; keep only links belonging to
-        // this novel so latest-chapter widgets and related novels cannot leak in.
-        val novelPath = Uri.parse(baseUrl).path?.trimEnd('/').orEmpty()
+        val novelPath = java.net.URI(baseUrl).rawPath?.trimEnd('/').orEmpty()
         return doc.select(
             "a[href*=/chapter/], a[href*=chapter-], a[href*=chapter_], #chapterlist a, #chapter-list a, .chapter-list a, .list-chapter a, div.m-newest1 ul.ul-list5 a"
         ).mapNotNull { link ->
             val href = link.attr("href").takeIf { it.isNotBlank() }
                 ?: return@mapNotNull null
             val chapterUrl = fixUrlNull(href) ?: return@mapNotNull null
-            val chapterPath = Uri.parse(chapterUrl).path ?: return@mapNotNull null
+            val chapterPath = runCatching { java.net.URI(chapterUrl).rawPath }.getOrNull() ?: return@mapNotNull null
             if (novelPath.isNotBlank() && !chapterPath.startsWith("$novelPath/")) {
                 return@mapNotNull null
             }
@@ -373,8 +385,26 @@ open class FreewebnovelProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val response = app.get(url)
+        val rawBody = response.text
+        val resolvedHost = runCatching { java.net.URI(response.url).host }.getOrNull() ?: "freewebnovel.com"
+        if (response.code == 403 || com.lagradost.quicknovel.network.isCloudflareChallengeResponse(
+                statusCode = response.code,
+                cfRay = null,
+                server = null,
+                cfMitigated = null,
+                location = null,
+                bodySample = rawBody.take(8192),
+            )
+        ) {
+            throw com.lagradost.quicknovel.network.CloudflareChallengeException(
+                url = response.url,
+                host = resolvedHost,
+                message = "Verification required for $resolvedHost. Tap 'Open verification' to continue.",
+            )
+        }
         val document = response.document
-        val name = document.selectFirst("h1.tit")?.text() ?: return null
+        val name = document.selectFirst("h1.tit, h1.title, h1")?.text()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: throw com.lagradost.quicknovel.ErrorLoadingException("Novel title could not be parsed on $resolvedHost")
         val genreText = document.selectFirst("span.glyphicon.glyphicon-th-list")
             ?.nextElementSiblings()?.firstOrNull()?.text().orEmpty()
         val restrictedGenres = setOf("adult", "ecchi", "smut", "mature", "explicit", "18+", "nsfw")
@@ -388,9 +418,12 @@ open class FreewebnovelProvider : MainAPI() {
                 ?: document.selectFirst("span[title=Author]")?.parent()?.selectFirst("a")?.text()
             tags =
                 document.selectFirst("span.glyphicon.glyphicon-th-list")?.nextElementSiblings()
-                    ?.get(0)
+                    ?.firstOrNull()
                     ?.text()
-                    ?.splitToSequence(", ")?.toList()
+                    ?.splitToSequence(", ")
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotEmpty() }
+                    ?.toList()
             posterUrl = fixUrlNull(
                 document.selectFirst("picture source")
                     ?.attr("srcset")
@@ -402,8 +435,8 @@ open class FreewebnovelProvider : MainAPI() {
             synopsis = document.selectFirst("div.inner")?.text()
             val votes = document.selectFirst("div.m-desc > div.score > p:nth-child(2)")
             if (votes != null) {
-                rating = votes.text().substringBefore('/').toFloat().times(200).toInt()
-                peopleVoted = votes.text().substringAfter('(').filter { it.isDigit() }.toInt()
+                score = Score.from5(votes.text().substringBefore('/'))
+                peopleVoted = votes.text().substringAfter('(').filter { it.isDigit() }.toIntOrNull()
             }
             val statusHeader0 = document.selectFirst("span.s1.s2")
             val statusHeader = document.selectFirst("span.s1.s3")
@@ -488,27 +521,29 @@ open class FreewebnovelProvider : MainAPI() {
                 ""
             )
     }
-     override suspend fun search(query: String): List<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse> {
+        val encoded = java.net.URLEncoder.encode(query.trim(), "UTF-8")
         val document = app.get(
-            "$mainUrl/search?keyword=${Uri.encode(query.trim()).replace("%20","+")}",
+            "$mainUrl/search?keyword=$encoded",
             headers = mapOf(
                 "referer" to mainUrl,
-                "x-requested-with" to "XMLHttpRequest",
-                "content-type" to "application/x-www-form-urlencoded",
                 "accept" to "*/*",
                 "user-agent" to USER_AGENT
             ),
         ).document
 
-        return document.select("div.li-row > div.li > div.con").mapNotNull { h ->
-            val h3 = h.selectFirst("div.txt > h3.tit > a") ?: return@mapNotNull null
+        return document.select("div.li-row").mapNotNull { h ->
+            val h3 = h.selectFirst("h3.tit > a") ?: return@mapNotNull null
+            val title = h3.attr("title").trim().ifBlank { h3.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
+            val href = h3.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
 
             newSearchResponse(
-                name = h3.attr("title") ?: return@mapNotNull null,
-                url = h3.attr("href") ?: return@mapNotNull null
+                name = title,
+                url = href
             ) {
                 posterUrl = fixUrlNull(h.selectFirst("div.pic img")?.attr("src"))
-                //latestChapter = h.select("div.item")[2].selectFirst("> div > a")?.text()
+                latestChapter = h.select("div.item").getOrNull(2)?.selectFirst("> div > a")?.text()
             }
         }
     }

@@ -544,7 +544,7 @@ class SettingsFragment : PreferenceFragmentCompat() {
                 {}) {
                 safe {
                     settingsManager.edit {
-                        AnyAdapter.sharedPool.clear()
+                        //AnyAdapter.sharedPool.clear()
                         putString(getString(R.string.download_format_key), prefValues[it])
                     }
                 }

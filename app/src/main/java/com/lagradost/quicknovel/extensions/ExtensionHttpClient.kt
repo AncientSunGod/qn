@@ -153,27 +153,30 @@ object ExtensionHttpClient {
             "Extension request body exceeds the 256 KB limit."
         }
 
-        val safeHeaders = headers.entries
-            .filter {
-                val name = it.key.lowercase(Locale.ROOT)
-                name in allowedRequestHeaders && name != "user-agent"
+        val safeHeaders = buildMap {
+            headers.entries.forEach { (rawKey, rawValue) ->
+                val lower = rawKey.lowercase(Locale.ROOT)
+                if (lower in allowedRequestHeaders && lower != "user-agent") {
+                    val normalizedKey = if (lower == "referrer") "Referer" else rawKey
+                    put(normalizedKey, rawValue.take(MAX_HEADER_VALUE_LENGTH))
+                }
             }
-            .associate { (key, value) ->
-                key to value.take(MAX_HEADER_VALUE_LENGTH)
-            }
+        }
 
         // A few sites return 403 to a plain HTTP client but allow a real browser
         // session after its normal page scripts and any interactive verification run.
         // Retry at most once per extension request; never suppress a server denial.
         var webViewRecoveryAttempted = false
-        repeat(MAX_REDIRECTS + 2) { redirectIndex ->
+        var collapsedDoubleSlash = false
+        repeat(MAX_REDIRECTS + 3) { redirectIndex ->
             val connection = (URL(currentUrl).openConnection() as HttpURLConnection)
             try {
                 connection.instanceFollowRedirects = false
                 connection.requestMethod = currentMethod
                 connection.connectTimeout = CONNECT_TIMEOUT_MS
                 connection.readTimeout = READ_TIMEOUT_MS
-                val requestHost = URL(currentUrl).host.lowercase(Locale.ROOT)
+                val parsedUrl = URL(currentUrl)
+                val requestHost = parsedUrl.host.lowercase(Locale.ROOT)
                 val browserUserAgent = runCatching {
                     WebViewResolver.getWebViewUserAgent()
                 }.getOrNull()
@@ -195,17 +198,43 @@ object ExtensionHttpClient {
                 // CookieManager is authoritative; do not replace its live value with a stale captured header.
                 val effectiveHeaders = browserHeaders + safeHeaders
                 connection.setRequestProperty("Connection", "keep-alive")
-                // Send ordinary navigation context by default. A number of novel sites
-                // reject bare programmatic requests when Accept/Referer are absent.
-                val requestOrigin = URL(currentUrl).let { "${it.protocol}://${it.host}" }
-                connection.setRequestProperty(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                )
+                // Send ordinary navigation context by default without polluting cross-origin API
+                // calls (such as translation endpoints) with a wrong same-target Origin header.
+                val requestOrigin = "${parsedUrl.protocol}://${parsedUrl.host}"
+                val callerReferer = effectiveHeaders.entries
+                    .firstOrNull { it.key.equals("Referer", ignoreCase = true) }
+                    ?.value
+                val callerRefererOrigin = callerReferer?.let { ref ->
+                    runCatching { URL(ref).let { "${it.protocol}://${it.host}" } }.getOrNull()
+                }
+                val hasExplicitAccept = effectiveHeaders.keys.any { it.equals("Accept", ignoreCase = true) }
+                val hasExplicitOrigin = effectiveHeaders.keys.any { it.equals("Origin", ignoreCase = true) }
+                val hasExplicitCacheControl = effectiveHeaders.keys.any { it.equals("Cache-Control", ignoreCase = true) }
+                if (!hasExplicitAccept) {
+                    connection.setRequestProperty(
+                        "Accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                    )
+                }
                 connection.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
-                connection.setRequestProperty("Referer", "$requestOrigin/")
-                connection.setRequestProperty("Origin", requestOrigin)
-                connection.setRequestProperty("Cache-Control", "max-age=0")
+                if (callerReferer == null) {
+                    connection.setRequestProperty("Referer", "$requestOrigin/")
+                }
+                if (!hasExplicitOrigin) {
+                    val derivedOrigin = when {
+                        callerRefererOrigin != null && !callerRefererOrigin.equals(requestOrigin, ignoreCase = true) ->
+                            callerRefererOrigin
+                        callerRefererOrigin == null || callerRefererOrigin.equals(requestOrigin, ignoreCase = true) ->
+                            requestOrigin
+                        else -> null
+                    }
+                    if (derivedOrigin != null && (currentMethod == "POST" || currentMethod == "PUT" || derivedOrigin.equals(requestOrigin, ignoreCase = true))) {
+                        connection.setRequestProperty("Origin", derivedOrigin)
+                    }
+                }
+                if (!hasExplicitCacheControl) {
+                    connection.setRequestProperty("Cache-Control", "max-age=0")
+                }
                 // Reuse the app's normal WebView cookie jar so extensions can maintain
                 // ordinary site sessions across requests. This does not solve or bypass
                 // server-side access challenges; it only sends cookies already issued to
@@ -244,6 +273,17 @@ object ExtensionHttpClient {
                 // Persist it before handling either branch so the next navigation/retry sees
                 // the complete session, not only cookies from successful 2xx responses.
                 storeResponseCookies(connection, currentUrl)
+                // Some extensions concatenate `site + "/_next/..."` where `site` ends in `/`,
+                // producing `https://host//_next/...`. Retry once with a single slash if 404.
+                if (status == 404 && !collapsedDoubleSlash && parsedUrl.path.startsWith("//")) {
+                    collapsedDoubleSlash = true
+                    val normalizedPath = "/" + parsedUrl.path.trimStart('/')
+                    val queryPart = parsedUrl.query?.let { "?$it" }.orEmpty()
+                    val portPart = if (parsedUrl.port != -1) ":${parsedUrl.port}" else ""
+                    val fixedUrl = "${parsedUrl.protocol}://${parsedUrl.host}$portPart$normalizedPath$queryPart"
+                    currentUrl = validateUrl(fixedUrl, allowedHosts)
+                    return@repeat
+                }
                 // Cloudflare may surface a browser-verification failure as 520
                 // rather than 403. Give the same host-scoped WebView session recovery
                 // one bounded attempt; if the origin itself is unavailable, the 520
@@ -264,7 +304,7 @@ object ExtensionHttpClient {
                     val browserSessionOpened = runCatching {
                         // This overload preserves existing WebView cookies and uses the
                         // app's browser resolver. The server still decides whether access
-                        // is allowed; a second 403 is returned unchanged to the extension.
+                        // is allowed; if a second challenge is returned, surface verification.
                         runBlocking {
                             WebViewResolver().resolveUsingWebView(
                                 url = currentUrl,
@@ -273,7 +313,8 @@ object ExtensionHttpClient {
                                 },
                                 // The resolver's default 5 seconds can expire while Cloudflare's
                                 // browser-side challenge script is still retrying its verification.
-                                completionStabilityDelay = 18.seconds,
+                                completionStabilityDelay = 12.seconds,
+                                maxTimeout = 22.seconds,
                             )
                         }
                     }.map { true }.getOrDefault(false)
@@ -327,12 +368,28 @@ object ExtensionHttpClient {
                     .associate { (key, values) ->
                         key.lowercase(Locale.ROOT) to values.first().take(MAX_HEADER_VALUE_LENGTH)
                     }
+                val bodyText = decodeText(bodyBytes, responseEncoding, connection.contentType)
+                if (allowedHosts != null && com.lagradost.quicknovel.network.isCloudflareChallengeResponse(
+                        statusCode = status,
+                        cfRay = responseHeaders["cf-ray"],
+                        server = responseHeaders["server"],
+                        cfMitigated = responseHeaders["cf-mitigated"],
+                        location = responseHeaders["location"],
+                        bodySample = bodyText.take(8192),
+                    )
+                ) {
+                    throw com.lagradost.quicknovel.network.CloudflareChallengeException(
+                        url = currentUrl,
+                        host = requestHost,
+                        message = "Cloudflare verification required for $requestHost. Tap 'Open verification' to continue.",
+                    )
+                }
                 return Result.success(
                     TextResponse(
                         url = currentUrl,
                         statusCode = status,
                         contentType = connection.contentType,
-                        body = decodeText(bodyBytes, responseEncoding, connection.contentType),
+                        body = bodyText,
                         statusText = connection.responseMessage.orEmpty(),
                         headers = responseHeaders,
                         bodyBytes = bodyBytes,

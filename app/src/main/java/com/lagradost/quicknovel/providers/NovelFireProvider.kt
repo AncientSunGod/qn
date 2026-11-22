@@ -8,6 +8,7 @@ import com.lagradost.quicknovel.HeadMainPageResponse
 import com.lagradost.quicknovel.LoadResponse
 import com.lagradost.quicknovel.MainAPI
 import com.lagradost.quicknovel.R
+import com.lagradost.quicknovel.Score
 import com.lagradost.quicknovel.SearchResponse
 import com.lagradost.quicknovel.UserReview
 import com.lagradost.quicknovel.fixUrl
@@ -99,7 +100,10 @@ internal fun parseNovelFireChapterHtml(
     return if (title.isEmpty()) bodyHtml else "<p>$title</p><br>$bodyHtml"
 }
 
-open class NovelFireProvider : MainAPI() {
+object NovelFireProvider : NovelFireAPI()
+
+open class NovelFireAPI : MainAPI() {
+    override val usesCloudFlareKiller = true
     override val name = "NovelFire"
     override val mainUrl = "https://novelfire.net"
     override val iconId = R.drawable.icon_novelfire
@@ -178,27 +182,30 @@ open class NovelFireProvider : MainAPI() {
         orderBy: String?,
         tag: String?
     ): HeadMainPageResponse {
-        val url = "$mainUrl/genre-${tag}/${orderBy}/${mainCategory}/all-novel?page=$page"
+        val safeTag = tag?.takeIf { it.isNotBlank() } ?: "all"
+        val safeOrder = orderBy?.takeIf { it.isNotBlank() } ?: "sort-popular"
+        val safeCategory = mainCategory?.takeIf { it.isNotBlank() } ?: "status-all"
+        val url = "$mainUrl/genre-$safeTag/$safeOrder/$safeCategory/all-novel?page=$page"
         val document = app.get(url).document
 
-
         val returnValue = document.select("li.novel-item").mapNotNull { select ->
-            val node = select.selectFirst("a[title]") ?: return@mapNotNull null
-            val href = node.attr("href")
-            val title =
-                node.attr("title").takeIf { !it.isEmpty() } ?: node.selectFirst("h4.novel-title")
-                    ?.text() ?: return@mapNotNull null
+            val node = select.selectFirst("a[title], a[href]") ?: return@mapNotNull null
+            val href = node.attr("href").trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val title = node.attr("title").trim()
+                .ifBlank { select.selectFirst("h4.novel-title, .novel-title, h4")?.text()?.trim().orEmpty() }
+                .ifBlank { node.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
 
             newSearchResponse(
                 name = title,
                 url = href
             ) {
                 posterUrl = fixUrlNull(
-                    select.selectFirst("img")?.attr("data-src")
-                        ?: select.selectFirst("img")?.attr("src")
+                    select.selectFirst("img")?.let { img ->
+                        img.attr("data-src").ifBlank { img.attr("src") }
+                    }
                 )
             }
-
         }
         return HeadMainPageResponse(url, returnValue)
     }
@@ -249,8 +256,7 @@ open class NovelFireProvider : MainAPI() {
                     ?.replace(Regex("[^0-9]"), "")
                     ?.trim()
                     ?.toIntOrNull() ?: 0
-            this.rating = document.selectFirst("div.rating strong.nub")?.text()
-                ?.toFloatOrNull()?.times(20)?.times(10)?.roundToInt()
+            score = Score.from5(document.selectFirst("div.rating strong.nub")?.text())
             related = id?.let { runCatching { getRelated(it) }.getOrDefault(emptyList()) } ?: emptyList()
             reviewData = id
         }
@@ -304,7 +310,12 @@ open class NovelFireProvider : MainAPI() {
                         this.dateOfRelease = item.createdAt
                     }
                 } ?: emptyList()
-            }.getOrDefault(emptyList())
+            }.getOrElse { error ->
+                if (com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(error) != null) {
+                    throw error
+                }
+                emptyList()
+            }
 
             if (ajaxChapters.isNotEmpty()) return ajaxChapters
         }

@@ -77,13 +77,14 @@ internal fun parseFaqWikiNovels(
     }
 }
 
-class FaqWikiProvider : MainAPI() {
+object FaqWikiProvider : MainAPI() {
     override val name = "FaqWiki"
     override val mainUrl = "https://faqwiki.us/novel"
     private val siteRoot = "https://faqwiki.us"
     override val iconId = R.drawable.icon_faqwiki
     override val iconBackgroundId = R.color.black
     override val hasMainPage = true
+    override val usesCloudFlareKiller = true
 
     override suspend fun loadMainPage(
         page: Int,
@@ -199,7 +200,12 @@ class FaqWikiProvider : MainAPI() {
                     }
                 }
             } ?: emptyList()
-        }.getOrDefault(emptyList())
+        }.getOrElse { error ->
+            if (com.lagradost.quicknovel.network.CloudflareChallengeManager.findCloudflareChallenge(error) != null) {
+                throw error
+            }
+            emptyList()
+        }
 
         if (ajaxResults.isNotEmpty()) return ajaxResults
 
